@@ -40,6 +40,18 @@ _STEP: int = 0
 _MANIFEST: list[dict[str, Any]] = []
 
 
+def gdn_dump_reset() -> None:
+    """Reset module state so a new GDN_DUMP_CASE can run in the same process."""
+    global _ENABLED, _DIR, _CASE, _OPS_FILTER, _SAVE_FP32, _STEP, _MANIFEST
+    _ENABLED = None
+    _DIR = ""
+    _CASE = "default"
+    _OPS_FILTER = None
+    _SAVE_FP32 = False
+    _STEP = 0
+    _MANIFEST = []
+
+
 def _init() -> bool:
     global _ENABLED, _DIR, _CASE, _OPS_FILTER, _SAVE_FP32
     if _ENABLED is not None:

@@ -98,9 +98,11 @@ def _run_one_case(
     run_bwd: bool,
 ) -> dict[str, Any]:
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    from fla.ops.gated_delta_rule.dump import gdn_dump_reset
 
     t0 = time.time()
     name = str(case["name"])
+    gdn_dump_reset()
     os.environ["GDN_DUMP_DIR"] = str(dump_dir)
     os.environ["GDN_DUMP_CASE"] = name
     os.environ["GDN_DUMP_OPS"] = ops
