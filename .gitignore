@@ -6,6 +6,7 @@ data
 
 # bash scripts
 *.sh
+!run_kda_dump_cases.sh
 
 # docs
 docs/_build

@@ -17,6 +17,7 @@ from fla.ops.common.gate import fused_beta_sigmoid, fused_beta_sigmoid_bwd
 from fla.ops.cp import FLACPContext
 from fla.ops.kda.chunk_bwd import chunk_kda_bwd
 from fla.ops.kda.chunk_fwd import chunk_kda_fwd
+from fla.ops.kda.dump import kda_dump_enabled, kda_dump_op
 from fla.ops.utils.index import prepare_chunk_indices
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
@@ -98,7 +99,61 @@ class ChunkKDAFunction(torch.autograd.Function):
         if return_intermediate_states:
             assert torch.is_inference_mode_enabled(), "return_intermediate_states is only allowed in inference mode"
             assert disable_recompute is False, "return_intermediate_states must be used with disable_recompute=False"
+            if kda_dump_enabled():
+                kda_dump_op(
+                    "chunk_kda_fwd",
+                    inputs={
+                        "q": q, "k": k, "v": v, "g": g_input, "beta": beta_raw,
+                        "A_log": A_log, "dt_bias": dt_bias,
+                        "initial_state": initial_state,
+                        "scale": scale,
+                        "cu_seqlens": cu_seqlens,
+                        "chunk_indices": chunk_indices,
+                    },
+                    outputs={"o": o, "final_state": final_state, "h": h},
+                    meta={
+                        "chunk_size": chunk_size,
+                        "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
+                        "use_gate_in_kernel": use_gate_in_kernel,
+                        "use_beta_sigmoid_in_kernel": use_beta_sigmoid_in_kernel,
+                        "allow_neg_eigval": allow_neg_eigval,
+                        "safe_gate": safe_gate,
+                        "lower_bound": lower_bound,
+                        "state_v_first": state_v_first,
+                        "output_final_state": output_final_state,
+                        "return_intermediate_states": True,
+                        "cu_seqlens": cu_seqlens,
+                        "chunk_indices": chunk_indices,
+                    },
+                )
             return o.type_as(q), final_state, h
+
+        if kda_dump_enabled():
+            kda_dump_op(
+                "chunk_kda_fwd",
+                inputs={
+                    "q": q, "k": k, "v": v, "g": g_input, "beta": beta_raw,
+                    "A_log": A_log, "dt_bias": dt_bias,
+                    "initial_state": initial_state,
+                    "scale": scale,
+                    "cu_seqlens": cu_seqlens,
+                    "chunk_indices": chunk_indices,
+                },
+                outputs={"o": o, "final_state": final_state},
+                meta={
+                    "chunk_size": chunk_size,
+                    "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
+                    "use_gate_in_kernel": use_gate_in_kernel,
+                    "use_beta_sigmoid_in_kernel": use_beta_sigmoid_in_kernel,
+                    "allow_neg_eigval": allow_neg_eigval,
+                    "safe_gate": safe_gate,
+                    "lower_bound": lower_bound,
+                    "state_v_first": state_v_first,
+                    "output_final_state": output_final_state,
+                    "cu_seqlens": cu_seqlens,
+                    "chunk_indices": chunk_indices,
+                },
+            )
 
         ctx.save_for_backward(
             q, q_rstd, k, k_rstd, v, g_cumsum, g_input, beta_raw, beta, A_log, dt_bias, Aqk, Akk,
