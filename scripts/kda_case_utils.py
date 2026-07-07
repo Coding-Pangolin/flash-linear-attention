@@ -60,6 +60,19 @@ def generate_cu_seqlens(
         lengths[i] -= 1
         diff += 1
 
+    # When seg_max * B < T, allow segments to exceed seg_max so sum == T.
+    guard = 0
+    while diff != 0 and guard < B * (seg_max - seg_min + 64):
+        guard += 1
+        if diff > 0:
+            i = min(range(B), key=lambda j: lengths[j])
+            lengths[i] += 1
+            diff -= 1
+        else:
+            i = max(range(B), key=lambda j: lengths[j])
+            lengths[i] -= 1
+            diff += 1
+
     sorted_l = sorted(lengths)
     seq_lengths: list[int] = []
     i, j = 0, len(sorted_l) - 1
@@ -76,7 +89,10 @@ def generate_cu_seqlens(
     for seg in seq_lengths:
         cu.append(cu[-1] + seg)
     if cu[-1] != total_length:
-        raise ValueError(f"generate_cu_seqlens: sum={cu[-1]} != T={total_length}")
+        raise ValueError(
+            f"generate_cu_seqlens: sum={cu[-1]} != T={total_length}, "
+            f"cu_seqlens_len={cu_seqlens_len}, seg=[{seg_min},{seg_max}]"
+        )
     return torch.tensor(cu, dtype=torch.long)
 
 
