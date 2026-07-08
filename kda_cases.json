@@ -113,6 +113,23 @@
       "dtype": "bf16",
       "varlen": true,
       "mean_len": 8
+    },
+    {
+      "name": "model_fused_t131072",
+      "description": "Prod fused model case: B=1 T=131072 Hk=Hv=2 K=V=128 cs=64 bf16 (NPU MODEL_CASE)",
+      "enabled": true,
+      "B": 1,
+      "T": 131072,
+      "query_head": 2,
+      "value_head": 2,
+      "Kdim": 128,
+      "Vdim": 128,
+      "chunk_size": 64,
+      "dtype": "bf16",
+      "varlen": false,
+      "seed": 20260707,
+      "data_scale": 1.0,
+      "input_style": "npu_model"
     }
   ]
 }

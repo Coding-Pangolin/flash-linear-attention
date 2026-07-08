@@ -135,6 +135,20 @@ PY
 | gva_t4096_v128 | GVA 长序列 | 1 | 4096 | 8 | 16 | 128 | 128 | 64 | |
 | mha_cs32 | cs=32 | 1 | 512 | 4 | 4 | 128 | 128 | 32 | |
 | gva_var_t1024 | GVA 变长 | 1 | 1024 | 4 | 8 | 128 | 128 | 64 | ✓ |
+| model_fused_t131072 | Prod model | 1 | 131072 | 2 | 2 | 128 | 128 | 64 | |
+
+`model_fused_t131072` 与 NPU `test_npu_chunk_kda.py` 的 `MODEL_CASE` 对齐（`seed=20260707`，fused kernel 配置相同）。T=131072 较大，建议单独采集：
+
+```bash
+./run_kda_dump_cases.sh --names model_fused_t131072 --dump-dir /data/kda_dump/model
+```
+
+NPU 三标杆：
+
+```bash
+TEST_DEVICE_ID=0 python torch_custom/fla_npu/test/test_npu_chunk_kda_gpu_dump_dual.py \
+  /data/kda_dump/model --case model_fused_t131072
+```
 
 ---
 

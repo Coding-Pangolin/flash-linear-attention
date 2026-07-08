@@ -167,6 +167,18 @@ def _rand_uniform(shape: tuple[int, ...], dtype: torch.dtype, half_range: float,
     return x.to(dtype=dtype)
 
 
+def _rand_uniform_npu_style(
+    shape: tuple[int, ...], dtype: torch.dtype, half_range: float, device: torch.device
+) -> torch.Tensor:
+    """Match torch_custom/fla_npu/test/test_npu_chunk_kda.py _make_model_fused_inputs."""
+    x = torch.rand(shape, dtype=dtype, device=device)
+    return (x * 2.0 - 1.0) * float(half_range)
+
+
+def _l2norm_lastdim(x: torch.Tensor) -> torch.Tensor:
+    return x / x.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+
+
 def _default_kernel_flags(case: dict[str, Any]) -> dict[str, Any]:
     """Production-like defaults aligned with FlashKDA / benchmark registry."""
     flags = {
@@ -209,24 +221,39 @@ def build_kda_inputs(
     if varlen and B != 1:
         raise ValueError(f"varlen case {case['name']} expects B=1, got B={B}")
 
-    torch.manual_seed(seed)
-    random.seed(seed)
+    case_seed = int(case.get("seed", seed))
+    data_scale = float(case.get("data_scale", 1.0))
+    input_style = str(case.get("input_style", "default")).strip().lower()
+
+    torch.manual_seed(case_seed)
+    random.seed(case_seed)
 
     low = ktype in (torch.float16, torch.bfloat16)
-    hr = _LOW_PRECISION_HALF_RANGE if low else 2e-2
+    hr = (_LOW_PRECISION_HALF_RANGE if low else 2e-2) * data_scale
 
-    q = _rand_uniform((B, T, Hk, K), ktype, hr, device)
-    k = _rand_uniform((B, T, Hk, K), ktype, hr, device)
-    v = _rand_uniform((B, T, Hv, V), ktype, hr, device)
+    if input_style == "npu_model":
+        # Byte-align with test_npu_chunk_kda._make_model_fused_inputs (bf16 rand + host l2norm).
+        q = _rand_uniform_npu_style((B, T, Hk, K), ktype, hr, device)
+        k = _rand_uniform_npu_style((B, T, Hk, K), ktype, hr, device)
+        v = _rand_uniform_npu_style((B, T, Hv, V), ktype, hr, device)
+        q = _l2norm_lastdim(q)
+        k = _l2norm_lastdim(k)
+    else:
+        q = _rand_uniform((B, T, Hk, K), ktype, hr, device)
+        k = _rand_uniform((B, T, Hk, K), ktype, hr, device)
+        v = _rand_uniform((B, T, Hv, V), ktype, hr, device)
 
     flags = _default_kernel_flags(case)
+    if input_style == "npu_model":
+        # q/k already normalized in Python, same as NPU model test feeding npu_chunk_kda_fwd.
+        flags["use_qk_l2norm_in_kernel"] = False
     use_gate = flags["use_gate_in_kernel"]
     use_beta_sig = flags["use_beta_sigmoid_in_kernel"]
 
     if use_gate:
-        g = torch.randn(B, T, Hv, K, dtype=ktype, device=device)
-        A_log = torch.log(torch.empty(Hv, dtype=torch.float32, device=device).uniform_(1, 16))
-        dt_bias = torch.randn(Hv * K, dtype=torch.float32, device=device)
+        g = torch.randn(B, T, Hv, K, dtype=ktype, device=device) * data_scale
+        A_log = torch.log(torch.empty(Hv, dtype=torch.float32, device=device).uniform_(1, 16)) * data_scale
+        dt_bias = torch.randn(Hv * K, dtype=torch.float32, device=device) * data_scale
     else:
         import torch.nn.functional as F
         g = F.logsigmoid(torch.randn(B, T, Hv, K, dtype=torch.float32, device=device)).to(ktype)
@@ -234,7 +261,7 @@ def build_kda_inputs(
         dt_bias = None
 
     if use_beta_sig:
-        beta = torch.randn(B, T, Hv, dtype=ktype, device=device)
+        beta = torch.randn(B, T, Hv, dtype=ktype, device=device) * data_scale
     else:
         beta = torch.sigmoid(_rand_uniform((B, T, Hv), ktype, 0.5, device))
 
@@ -250,7 +277,7 @@ def build_kda_inputs(
 
     scale = float(case.get("scale", K ** -0.5))
     num_seqs = len(cu_seqlens) - 1 if cu_seqlens is not None else B
-    initial_state = torch.randn(num_seqs, Hv, K, V, dtype=torch.float32, device=device)
+    initial_state = torch.randn(num_seqs, Hv, K, V, dtype=torch.float32, device=device) * data_scale
 
     return {
         "q": q,
@@ -278,7 +305,9 @@ def build_kda_inputs(
             "varlen": varlen,
             "dtype": case["dtype"],
             "scale": scale,
-            "seed": seed,
+            "seed": case_seed,
+            "data_scale": data_scale,
+            "input_style": input_style,
             "mean_len": case.get("mean_len"),
             "cu_seqlens": cu_seqlens.detach().cpu().tolist() if cu_seqlens is not None else None,
             **flags,
