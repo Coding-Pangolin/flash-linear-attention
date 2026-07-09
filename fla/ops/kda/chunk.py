@@ -17,6 +17,7 @@ from fla.ops.common.gate import fused_beta_sigmoid, fused_beta_sigmoid_bwd
 from fla.ops.cp import FLACPContext
 from fla.ops.kda.chunk_bwd import chunk_kda_bwd
 from fla.ops.kda.chunk_fwd import chunk_kda_fwd
+from fla.ops.kda.debug_g import kda_fwd_debug_g_enabled
 from fla.ops.kda.dump import kda_dump_enabled, kda_dump_op
 from fla.ops.utils.index import prepare_chunk_indices
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
@@ -71,6 +72,12 @@ class ChunkKDAFunction(torch.autograd.Function):
             )
 
         g_input = g
+
+        if kda_fwd_debug_g_enabled():
+            print(
+                "[KDA_FWD_DEBUG_G] ChunkKDAFunction.forward -> chunk_kda_fwd (triton multi-kernel path)",
+                flush=True,
+            )
 
         (o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg, v_new, h, initial_state) = chunk_kda_fwd(
             q=q,

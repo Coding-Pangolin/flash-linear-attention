@@ -114,8 +114,26 @@ class FlashKDABackend(BaseBackend):
     ):
         import flash_kda
 
+        from fla.ops.kda.debug_g import log_kda_g_before_intra
+
         if scale is None:
             scale = q.shape[-1] ** -0.5
+
+        chunk_size = kwargs.get("chunk_size", 64)
+        chunk_indices = kwargs.get("chunk_indices")
+        log_kda_g_before_intra(
+            path=f"flash_kda CUTLASS fused ({__file__})",
+            g=g,
+            use_gate_in_kernel=True,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+            chunk_size=chunk_size,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            scale=float(scale),
+        )
 
         K = q.shape[-1]
         HV, V = v.shape[2], v.shape[-1]

@@ -90,6 +90,17 @@ def run_chunk_kda_from_debug_dump(
         Default auto: ``False`` if beta looks like sigmoid output, else ``True``.
     """
     from fla.ops.kda import chunk_kda
+    from fla.ops.kda import chunk_fwd as _chunk_fwd_mod
+    from fla.ops.kda.debug_g import kda_fwd_debug_g_enabled
+
+    if kda_fwd_debug_g_enabled():
+        print(
+            f"[KDA_FWD_DEBUG_G] run_chunk_kda_from_debug_dump: "
+            f"KDA_FWD_DEBUG_G={os.environ.get('KDA_FWD_DEBUG_G')} "
+            f"FLA_FLASH_KDA={os.environ.get('FLA_FLASH_KDA', '(default)')} "
+            f"chunk_fwd={_chunk_fwd_mod.__file__}",
+            flush=True,
+        )
 
     if isinstance(dump, (str, Path)):
         data = load_kda_debug_dump(dump)
