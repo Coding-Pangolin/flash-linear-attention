@@ -25,8 +25,85 @@ from typing import Any, Mapping, Union
 # Prefer repo root when running: python3 scripts/kda_debug_replay.py ...
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _GPU_ROOT = _SCRIPT_DIR.parent
-if str(_GPU_ROOT) not in sys.path:
-    sys.path.insert(0, str(_GPU_ROOT))
+
+
+def _bootstrap_local_fla(gpu_root: Path, *, force_triton: bool = False) -> None:
+    """Force imports from this repo's ``fla/``, not site-packages.
+
+    ``pip install -e .`` is optional; ``PYTHONPATH=<repo>`` or this bootstrap
+    is enough when you run the script from the checkout.
+    """
+    gpu_root = gpu_root.resolve()
+    chunk_fwd = gpu_root / "fla" / "ops" / "kda" / "chunk_fwd.py"
+    if not chunk_fwd.is_file():
+        raise RuntimeError(
+            f"expected {chunk_fwd} — you are not on feat/kda-gpu-dump (or equivalent).\n"
+            "  git fetch coding-pangolin feat/kda-gpu-dump && git checkout feat/kda-gpu-dump"
+        )
+
+    if force_triton:
+        os.environ["FLA_FLASH_KDA"] = "0"
+        os.environ["FLA_DISABLE_BACKEND_DISPATCH"] = "1"
+
+    root_s = str(gpu_root)
+    if root_s in sys.path:
+        sys.path.remove(root_s)
+    sys.path.insert(0, root_s)
+
+    # Drop any previously imported fla (e.g. from site-packages in REPL / notebook).
+    for name in list(sys.modules):
+        if name == "fla" or name.startswith("fla."):
+            del sys.modules[name]
+
+
+def _print_fla_import_paths() -> None:
+    import fla
+    import fla.ops.kda.chunk as kda_chunk_mod
+    import fla.ops.kda.chunk_fwd as kda_chunk_fwd_mod
+
+    from fla.ops.backends import BackendRegistry
+
+    BackendRegistry.ensure_initialized("kda")
+    reg = BackendRegistry._registries.get("kda")
+    active = reg.get_active() if reg is not None else None
+
+    print("[kda_debug_replay] === fla import paths ===", flush=True)
+    print(f"  fla.__file__              = {fla.__file__}", flush=True)
+    print(f"  fla.ops.kda.chunk         = {kda_chunk_mod.__file__}", flush=True)
+    print(f"  fla.ops.kda.chunk_fwd     = {kda_chunk_fwd_mod.__file__}", flush=True)
+    print(f"  chunk_kda                 = {kda_chunk_mod.chunk_kda}", flush=True)
+    print(
+        f"  FLA_FLASH_KDA             = {os.environ.get('FLA_FLASH_KDA', '(default)')}",
+        flush=True,
+    )
+    print(
+        f"  FLA_DISABLE_BACKEND_DISPATCH = "
+        f"{os.environ.get('FLA_DISABLE_BACKEND_DISPATCH', '0')}",
+        flush=True,
+    )
+    print(
+        f"  active kda backend        = "
+        f"{None if active is None else active.backend_type}",
+        flush=True,
+    )
+    print("[kda_debug_replay] ========================", flush=True)
+
+    repo_root = _GPU_ROOT.resolve()
+    for label, path in (
+        ("fla", fla.__file__),
+        ("chunk", kda_chunk_mod.__file__),
+        ("chunk_fwd", kda_chunk_fwd_mod.__file__),
+    ):
+        if path is None or not Path(path).resolve().is_relative_to(repo_root):
+            raise RuntimeError(
+                f"{label} loaded from {path!r}, not under repo {repo_root}.\n"
+                "Your prints in the checkout are ignored. Use one of:\n"
+                f"  PYTHONPATH={repo_root} python3 scripts/kda_debug_replay.py ...\n"
+                f"  python3 scripts/kda_debug_replay.py --fla-root {repo_root} ...\n"
+                "Or fix editable install: pip uninstall flash-linear-attention fla -y; "
+                f"pip install -e {repo_root}"
+            )
+
 
 import torch
 
@@ -174,6 +251,8 @@ def run_chunk_kda_from_debug_dump(
     use_beta_sigmoid_in_kernel: bool | None = None,
     output_final_state: bool = True,
     verbose: bool = True,
+    fla_root: Path | None = None,
+    force_triton: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run GPU ``chunk_kda`` with tensors from a prod debug dump.
 
@@ -189,6 +268,10 @@ def run_chunk_kda_from_debug_dump(
     use_beta_sigmoid_in_kernel:
         Default auto: ``False`` if beta looks like sigmoid output, else ``True``.
     """
+    gpu_root = (fla_root or _GPU_ROOT).resolve()
+    _bootstrap_local_fla(gpu_root, force_triton=force_triton)
+    _print_fla_import_paths()
+
     from fla.ops.kda import chunk_kda
 
     if isinstance(dump, (str, Path)):
@@ -299,16 +382,43 @@ if __name__ == "__main__":
     import sys
 
     p = argparse.ArgumentParser(description="Run chunk_kda from kda_debug_input_tensors dump")
-    p.add_argument("pt_path", type=Path, help="e.g. kda_debug_input_tensors_rank0.pt")
+    p.add_argument("pt_path", nargs="?", type=Path, help="e.g. kda_debug_input_tensors_rank0.pt")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--chunk-size", type=int, default=64)
+    p.add_argument(
+        "--fla-root",
+        type=Path,
+        default=None,
+        help=f"repo root containing fla/ (default: {_GPU_ROOT})",
+    )
+    p.add_argument(
+        "--force-triton",
+        action="store_true",
+        help="set FLA_FLASH_KDA=0 and FLA_DISABLE_BACKEND_DISPATCH=1 (skip FlashKDA)",
+    )
+    p.add_argument(
+        "--check-imports",
+        action="store_true",
+        help="only print which fla/ files Python loads, then exit",
+    )
     args = p.parse_args()
 
     try:
+        if args.check_imports:
+            gpu_root = (args.fla_root or _GPU_ROOT).resolve()
+            _bootstrap_local_fla(gpu_root, force_triton=args.force_triton)
+            _print_fla_import_paths()
+            raise SystemExit(0)
+
+        if args.pt_path is None:
+            p.error("pt_path is required unless --check-imports is set")
+
         run_chunk_kda_from_debug_dump(
             args.pt_path,
             device=args.device,
             chunk_size=args.chunk_size,
+            fla_root=args.fla_root,
+            force_triton=args.force_triton,
         )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
