@@ -6,12 +6,14 @@
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import importlib.util
+import os
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from fla.ops.kda import chunk_kda, fused_recurrent_kda
+from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
 from fla.ops.kda.gate import fused_kda_gate, naive_kda_gate, naive_kda_lowerbound_gate
 from fla.ops.kda.naive import naive_chunk_kda, naive_recurrent_kda
@@ -1314,3 +1316,123 @@ def test_flash_kda_chunk_varlen(H, D, cu_seqlens, monkeypatch):
     )
     assert_close("o", ref_o, tri_o, _FLASH_KDA_RTOL)
     assert_close("ht", ref_ht, tri_ht.to(ref_ht.dtype), _FLASH_KDA_RTOL)
+
+
+# ---------------------------------------------------------------------------
+# NPU prod fused-kernel model case (B=1 T=131072 H=HV=2 K=V=128 cs=64 bf16)
+# Mirrors torch_custom/fla_npu/test/test_npu_chunk_kda.py MODEL_CASE.
+# ---------------------------------------------------------------------------
+
+MODEL_CASE = dict(
+    B=1,
+    T=131072,
+    Hk=2,
+    Hv=2,
+    K=128,
+    V=128,
+    chunk_size=64,
+    dtype=torch.bfloat16,
+)
+MODEL_DATA_SCALE = float(os.environ.get("MODEL_DATA_SCALE", "1.0"))
+MODEL_GK_SCALE = float(os.environ.get("MODEL_GK_SCALE", "1.0"))
+
+_SKIP_MODEL_CUDA = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="model fused KDA case requires CUDA",
+)
+
+
+def _l2norm_lastdim(x: torch.Tensor) -> torch.Tensor:
+    return x / x.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+
+
+def _make_model_fused_inputs(seed=20260707, data_scale=MODEL_DATA_SCALE):
+    c = MODEL_CASE
+    b, t, hk, hv, kdim, vdim = c["B"], c["T"], c["Hk"], c["Hv"], c["K"], c["V"]
+    dtype = c["dtype"]
+    dev = torch.device("cuda")
+    torch.manual_seed(seed)
+    s = float(data_scale)
+
+    half_range = 6.5e-3 * s
+    q = (torch.rand(b, t, hk, kdim, device=dev, dtype=dtype) * 2.0 - 1.0) * half_range
+    k = (torch.rand(b, t, hk, kdim, device=dev, dtype=dtype) * 2.0 - 1.0) * half_range
+    v = (torch.rand(b, t, hv, vdim, device=dev, dtype=dtype) * 2.0 - 1.0) * half_range
+    q = _l2norm_lastdim(q)
+    k = _l2norm_lastdim(k)
+
+    g_raw = torch.randn(b, t, hv, kdim, device=dev, dtype=dtype) * s
+    a_log = torch.log(torch.empty(hv, device=dev, dtype=torch.float32).uniform_(1, 16)) * s
+    dt_bias = torch.randn(hv * kdim, device=dev, dtype=torch.float32) * s
+    beta_raw = torch.randn(b, t, hv, device=dev, dtype=dtype) * s
+    initial_state = torch.randn(b, hv, kdim, vdim, device=dev, dtype=torch.float32) * s
+    scale = kdim ** -0.5
+    return dict(
+        q=q,
+        k=k,
+        v=v,
+        g_raw=g_raw,
+        beta_raw=beta_raw,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        initial_state=initial_state,
+        scale=scale,
+        chunk_size=c["chunk_size"],
+    )
+
+
+@_SKIP_MODEL_CUDA
+@torch.inference_mode()
+def test_chunk_model_fused_t131072_mha_bf16():
+    """Prod-like fused path; checks finite o/final_state (same shape as NPU model test)."""
+    bundle = _make_model_fused_inputs()
+    gk = kda_gate_chunk_cumsum(
+        g=bundle["g_raw"],
+        A_log=bundle["a_log"],
+        dt_bias=bundle["dt_bias"],
+        chunk_size=bundle["chunk_size"],
+        lower_bound=-5.0,
+    )
+    print(
+        f"[diag] gk range: min={gk.min().item():.4f} max={gk.max().item():.4f}",
+        flush=True,
+    )
+    if MODEL_GK_SCALE != 1.0:
+        pytest.skip(
+            "MODEL_GK_SCALE on GPU requires feeding pre-scaled gk without re-cumsum; "
+            "use NPU test for gk*0.01 overflow experiment, or scale g_raw (not identical)."
+        )
+
+    o, final_state = chunk_kda(
+        bundle["q"],
+        bundle["k"],
+        bundle["v"],
+        bundle["g_raw"],
+        bundle["beta_raw"],
+        A_log=bundle["a_log"],
+        dt_bias=bundle["dt_bias"],
+        scale=bundle["scale"],
+        chunk_size=bundle["chunk_size"],
+        initial_state=bundle["initial_state"],
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        safe_gate=True,
+        lower_bound=-5.0,
+    )
+    assert o.shape == (MODEL_CASE["B"], MODEL_CASE["T"], MODEL_CASE["Hv"], MODEL_CASE["V"])
+    assert final_state.shape == (MODEL_CASE["B"], MODEL_CASE["Hv"], MODEL_CASE["K"], MODEL_CASE["V"])
+    assert torch.isfinite(o).all(), "model o contains NaN/Inf"
+    assert torch.isfinite(final_state).all(), "model final_state contains NaN/Inf"
+    print(
+        f"[diag] o range: min={o.float().min().item():.4f} max={o.float().max().item():.4f}",
+        flush=True,
+    )
+
+
+if __name__ == "__main__":
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA required for model fused KDA case")
+    test_chunk_model_fused_t131072_mha_bf16()
+    print("PASS: test_chunk_model_fused_t131072_mha_bf16")

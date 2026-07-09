@@ -150,6 +150,28 @@ TEST_DEVICE_ID=0 python torch_custom/fla_npu/test/test_npu_chunk_kda_gpu_dump_du
   /data/kda_dump/model --case model_fused_t131072
 ```
 
+### 3.4 从 dump 回放 GPU（重跑 / 验证 NaN）
+
+已有 `001_chunk_kda_fwd.pt` 时，可在 GPU 上直接加载 inputs 再跑 `chunk_kda`（不必重新随机生成）：
+
+```bash
+chmod +x run_kda_replay_dump.sh
+
+# 单个 case 目录
+./run_kda_replay_dump.sh /data/kda_dump/model/model_fused_t131072
+
+# 或直接指定 .pt
+./run_kda_replay_dump.sh /data/kda_dump/model/model_fused_t131072/001_chunk_kda_fwd.pt
+
+# 批量 smoke
+./run_kda_replay_dump.sh /data/kda_dump/all --phase smoke
+
+# 只关心是否 finite，不与 dump 内 golden 比
+./run_kda_replay_dump.sh /data/kda_dump/model/model_fused_t131072 --no-compare
+```
+
+输出示例：`[gpu] o finite ...`、`[compare/o] PASS/FAIL`（与采集时保存在 .pt 里的 `outputs.o` 对比）。
+
 ---
 
 ## 5. 同步到 NPU 机
