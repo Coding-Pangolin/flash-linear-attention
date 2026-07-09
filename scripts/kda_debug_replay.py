@@ -18,12 +18,111 @@ Quick use::
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any, Mapping, Union
+
+# Prefer repo root when running: python3 scripts/kda_debug_replay.py ...
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_GPU_ROOT = _SCRIPT_DIR.parent
+if str(_GPU_ROOT) not in sys.path:
+    sys.path.insert(0, str(_GPU_ROOT))
 
 import torch
 
 DumpLike = Union[str, Path, Mapping[str, Any]]
+
+
+def _kda_fwd_debug_g_enabled() -> bool:
+    return os.environ.get("KDA_FWD_DEBUG_G", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _print_tensor_stats(name: str, t: torch.Tensor | None) -> None:
+    if t is None:
+        print(f"[KDA_FWD_DEBUG_G] {name}: None", flush=True)
+        return
+    x = t.detach().float().reshape(-1).cpu()
+    finite = torch.isfinite(x)
+    n_finite = int(finite.sum())
+    n_total = x.numel()
+    if n_finite == 0:
+        print(
+            f"[KDA_FWD_DEBUG_G] {name}: shape={tuple(t.shape)} dtype={t.dtype} "
+            f"finite=0/{n_total}",
+            flush=True,
+        )
+        return
+    xf = x[finite]
+    print(
+        f"[KDA_FWD_DEBUG_G] {name}: shape={tuple(t.shape)} dtype={t.dtype} "
+        f"finite={n_finite}/{n_total} min={xf.min().item():.6g} max={xf.max().item():.6g} "
+        f"mean={xf.mean().item():.6g}",
+        flush=True,
+    )
+
+
+def _maybe_log_g_from_dump(
+    *,
+    g: torch.Tensor,
+    use_gate_in_kernel: bool,
+    safe_gate: bool,
+    lower_bound: float,
+    chunk_size: int,
+    scale: float,
+    A_log: torch.Tensor | None,
+    dt_bias: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+) -> None:
+    if not _kda_fwd_debug_g_enabled():
+        return
+
+    import fla.ops.kda.chunk as kda_chunk_mod
+
+    print(
+        f"[KDA_FWD_DEBUG_G] run_chunk_kda_from_debug_dump: "
+        f"KDA_FWD_DEBUG_G={os.environ.get('KDA_FWD_DEBUG_G')} "
+        f"FLA_FLASH_KDA={os.environ.get('FLA_FLASH_KDA', '(default)')} "
+        f"fla.ops.kda.chunk={kda_chunk_mod.__file__}",
+        flush=True,
+    )
+    _print_tensor_stats("g_raw (dump g, before cumsum)", g)
+
+    try:
+        from fla.ops.kda.debug_g import log_kda_g_before_intra
+
+        log_kda_g_before_intra(
+            path="kda_debug_replay",
+            g=g,
+            use_gate_in_kernel=use_gate_in_kernel,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+            chunk_size=chunk_size,
+            scale=scale,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            cu_seqlens=cu_seqlens,
+        )
+        return
+    except ImportError:
+        pass
+
+    if not use_gate_in_kernel:
+        print("[KDA_FWD_DEBUG_G] skip gk recompute (use_gate_in_kernel=False)", flush=True)
+        return
+
+    from fla.ops.kda.gate import kda_gate_chunk_cumsum
+    from fla.ops.utils.constant import RCP_LN2
+
+    gk = kda_gate_chunk_cumsum(
+        g=g,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=RCP_LN2,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+    )
+    _print_tensor_stats("gk (cumsum log2, intra input)", gk)
 
 
 def _finite_stats(t: torch.Tensor) -> str:
@@ -91,17 +190,6 @@ def run_chunk_kda_from_debug_dump(
         Default auto: ``False`` if beta looks like sigmoid output, else ``True``.
     """
     from fla.ops.kda import chunk_kda
-    from fla.ops.kda import chunk_fwd as _chunk_fwd_mod
-    from fla.ops.kda.debug_g import kda_fwd_debug_g_enabled
-
-    if kda_fwd_debug_g_enabled():
-        print(
-            f"[KDA_FWD_DEBUG_G] run_chunk_kda_from_debug_dump: "
-            f"KDA_FWD_DEBUG_G={os.environ.get('KDA_FWD_DEBUG_G')} "
-            f"FLA_FLASH_KDA={os.environ.get('FLA_FLASH_KDA', '(default)')} "
-            f"chunk_fwd={_chunk_fwd_mod.__file__}",
-            flush=True,
-        )
 
     if isinstance(dump, (str, Path)):
         data = load_kda_debug_dump(dump)
@@ -175,6 +263,18 @@ def run_chunk_kda_from_debug_dump(
         call_kw["initial_state"] = initial_state
     if cu_seqlens is not None:
         call_kw["cu_seqlens"] = cu_seqlens
+
+    _maybe_log_g_from_dump(
+        g=g,
+        use_gate_in_kernel=use_gate_in_kernel,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+        chunk_size=chunk_size,
+        scale=float(scale),
+        A_log=A_log if use_gate_in_kernel else None,
+        dt_bias=dt_bias if use_gate_in_kernel else None,
+        cu_seqlens=cu_seqlens,
+    )
 
     with torch.inference_mode():
         o, final_state = chunk_kda(**call_kw)
