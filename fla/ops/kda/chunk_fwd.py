@@ -5,6 +5,8 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+import os
+
 import torch
 
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -15,6 +17,34 @@ from fla.ops.kda.chunk_intra import chunk_kda_fwd_intra
 from fla.ops.kda.gate import kda_gate_chunk_cumsum
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
+
+
+def _kda_fwd_debug_g_enabled() -> bool:
+    return os.environ.get("KDA_FWD_DEBUG_G", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _print_tensor_stats(name: str, t: torch.Tensor | None) -> None:
+    if t is None:
+        print(f"[KDA_FWD_DEBUG_G] {name}: None", flush=True)
+        return
+    x = t.detach().float().reshape(-1).cpu()
+    finite = torch.isfinite(x)
+    n_finite = int(finite.sum())
+    n_total = x.numel()
+    if n_finite == 0:
+        print(
+            f"[KDA_FWD_DEBUG_G] {name}: shape={tuple(t.shape)} dtype={t.dtype} "
+            f"finite=0/{n_total} (all non-finite)",
+            flush=True,
+        )
+        return
+    xf = x[finite]
+    print(
+        f"[KDA_FWD_DEBUG_G] {name}: shape={tuple(t.shape)} dtype={t.dtype} "
+        f"finite={n_finite}/{n_total} min={xf.min().item():.6g} max={xf.max().item():.6g} "
+        f"mean={xf.mean().item():.6g}",
+        flush=True,
+    )
 
 
 def chunk_kda_fwd(
@@ -62,6 +92,17 @@ def chunk_kda_fwd(
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices
         )
+
+    if _kda_fwd_debug_g_enabled():
+        print(
+            f"[KDA_FWD_DEBUG_G] before chunk_kda_fwd_intra: "
+            f"use_gate_in_kernel={use_gate_in_kernel} safe_gate={safe_gate} "
+            f"lower_bound={lower_bound} chunk_size={chunk_size} scale={scale}",
+            flush=True,
+        )
+        if g_org is not None:
+            _print_tensor_stats("g_raw (before cumsum)", g_org)
+        _print_tensor_stats("gk (cumsum log2, passed as gk=)", g)
 
     # qg = None if disable_recompute is False
     w, u, qg, kg, Aqk, Akk = chunk_kda_fwd_intra(
