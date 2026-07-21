@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """GPU Triton vs CPU golden for chunk_kda_fwd_kernel_intra_sub_chunk.
 
-Run on CUDA with this repo installed (or PYTHONPATH=repo root)::
+Run on CUDA with this repo on PYTHONPATH (or editable install)::
 
+    pip install -e .   # recommended, so fla matches this checkout
     pip install ct
     python tests/ops/test_chunk_kda_fwd_intra_sub_chunk_gpu_cpu_dual.py --smoke
 
@@ -27,6 +28,10 @@ import torch
 import triton
 
 _TEST_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _TEST_DIR.parents[1]
+# Prefer this checkout's fla over a site-packages install (older wheels lack HV).
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 if str(_TEST_DIR) not in sys.path:
     sys.path.insert(0, str(_TEST_DIR))
 
@@ -66,6 +71,20 @@ def _make_gate_bnsd(
     return g.to(dtype).contiguous()
 
 
+def _kernel_arg_names(kernel) -> set[str]:
+    """Unwrap Autotune/Heuristics wrappers and collect JIT arg names."""
+    cur = kernel
+    names: set[str] = set()
+    for _ in range(6):
+        if hasattr(cur, "arg_names") and cur.arg_names:
+            names.update(cur.arg_names)
+        if hasattr(cur, "fn"):
+            cur = cur.fn
+            continue
+        break
+    return names
+
+
 def run_gpu_sub_chunk(
     q_bsnd: torch.Tensor,
     k_bsnd: torch.Tensor,
@@ -77,9 +96,12 @@ def run_gpu_sub_chunk(
     chunk_indices: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch Triton chunk_kda_fwd_kernel_intra_sub_chunk (safe_gate diagonal path)."""
+    import fla
     from fla.ops.kda.chunk_intra import chunk_kda_fwd_kernel_intra_sub_chunk
     from fla.ops.utils import prepare_chunk_indices as fla_prepare_chunk_indices
     from fla.utils import IS_GATHER_SUPPORTED
+
+    print(f"  [fla] using {fla.__file__}", flush=True)
 
     B, T, H, K = k_bsnd.shape
     HV = g_bsnd.shape[2]
@@ -99,7 +121,7 @@ def run_gpu_sub_chunk(
     Akkd = torch.zeros(B, T, HV, BC, device=k_bsnd.device, dtype=torch.float32)
 
     grid = (NT, NC, B * HV)
-    chunk_kda_fwd_kernel_intra_sub_chunk[grid](
+    kwargs = dict(
         q=q_bsnd,
         k=k_bsnd,
         g=g_bsnd,
@@ -111,13 +133,23 @@ def run_gpu_sub_chunk(
         chunk_indices=chunk_indices,
         T=T,
         H=H,
-        HV=HV,
         K=K,
         BT=BT,
         BC=BC,
         BK=BK,
         USE_GATHER=IS_GATHER_SUPPORTED,
     )
+    # Post-GVA kernels take HV; older site-packages installs only have H.
+    arg_names = _kernel_arg_names(chunk_kda_fwd_kernel_intra_sub_chunk)
+    if "HV" in arg_names:
+        kwargs["HV"] = HV
+    elif H != HV:
+        raise RuntimeError(
+            f"imported fla kernel has no HV arg (file={fla.__file__}) but H={H} != HV={HV}; "
+            "install/use this repo's fla (pip install -e .)"
+        )
+
+    chunk_kda_fwd_kernel_intra_sub_chunk[grid](**kwargs)
     torch.cuda.synchronize()
     return Aqk, Akkd
 
