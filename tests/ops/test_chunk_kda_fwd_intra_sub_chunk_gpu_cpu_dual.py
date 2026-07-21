@@ -242,9 +242,14 @@ def _diagnose_akkd_block(
         f"    diag cpu[:4]={Mc.diag()[:4].tolist()} gpu[:4]={Mg.diag()[:4].tolist()}",
         flush=True,
     )
-    # If gpu matches inv(I+L_cpu), residual_gpu small → same L, inv path OK.
-    # If residual_gpu huge but diag~1 → GPU used a different L (GEMM/TF32/bf16), not a wrong formula.
-    if resid_c < 1e-2 and resid_g > 1.0:
+    if resid_c > 1.0:
+        print(
+            "    => CPU residual already large: |L| too big for stable fp32 forward-sub "
+            "(raw randn k without L2 norm). Comparison is not meaningful; "
+            "re-run with default --l2norm (or smaller k).",
+            flush=True,
+        )
+    elif resid_c < 1e-2 and resid_g > 1.0:
         print(
             "    => GPU Akkd is NOT (I+L_cpu)^{-1}: L from GPU GEMM differs (bf16/TF32) "
             "or inv diverged; try --dtype fp32 to confirm.",
@@ -252,6 +257,11 @@ def _diagnose_akkd_block(
         )
     elif resid_g < 1e-1:
         print("    => GPU Akkd ≈ (I+L_cpu)^{-1}: logic aligned; error is mostly elsewhere.", flush=True)
+
+
+def _l2norm_last(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Match FLA use_qk_l2norm_in_kernel: normalize over K."""
+    return x / x.norm(dim=-1, keepdim=True).clamp_min(eps)
 
 
 def run_case(
@@ -274,6 +284,7 @@ def run_case(
     aqk_tol: float = 5e-2,
     akkd_rel_tol: float = 1e-2,
     diagnose: bool = False,
+    l2norm: bool = True,
 ) -> dict:
     torch.manual_seed(seed)
     if device.startswith("cuda"):
@@ -285,6 +296,10 @@ def run_case(
     scale = 1.0 / math.sqrt(K)
     q_bnsd = torch.randn(B, H, T, K, dtype=dtype)
     k_bnsd = torch.randn(B, H, T, K, dtype=dtype)
+    if l2norm:
+        # Without this, akk≈k@k.T has diag~K and |L|~O(10..100); fp32 (I+L)^{-1} blows up.
+        q_bnsd = _l2norm_last(q_bnsd.float()).to(dtype)
+        k_bnsd = _l2norm_last(k_bnsd.float()).to(dtype)
     g_bnsd = _make_gate_bnsd(B, H, T, K, dtype, gate)
     beta_bnsd = torch.rand(B, H, T, dtype=dtype)
 
@@ -336,7 +351,7 @@ def run_case(
     tag = f"cu={list(cu)}" if cu is not None else "dense"
     print(
         f"\n[case] B={B} H={H} T={T} K={K} BT={BT} {tag} gate={gate} dtype={dtype} "
-        f"cpu_dtype={cpu_dtype} t_cpu={t_cpu:.2f}s t_gpu={t_gpu:.2f}s",
+        f"cpu_dtype={cpu_dtype} l2norm={l2norm} t_cpu={t_cpu:.2f}s t_gpu={t_gpu:.2f}s",
         flush=True,
     )
     print(
@@ -410,6 +425,11 @@ def _parse_args() -> argparse.Namespace:
         "--diagnose",
         action="store_true",
         help="print worst Akkd block residual M@(I+L)-I (auto-on when Akkd assert fails)",
+    )
+    p.add_argument(
+        "--no-l2norm",
+        action="store_true",
+        help="disable Q/K L2 norm (will make |L|~O(K) and fp32 Akkd unstable)",
     )
     p.add_argument("--B", type=int, default=None)
     p.add_argument("--H", type=int, default=None)
