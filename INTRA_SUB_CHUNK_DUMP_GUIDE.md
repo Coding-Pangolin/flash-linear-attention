@@ -12,15 +12,16 @@
 | 项目 | 说明 |
 |------|------|
 | 算子 | Triton `chunk_kda_fwd_kernel_intra_sub_chunk`（`fla/ops/kda/chunk_intra.py`） |
+| CPU 标杆 | `tests/ops/chunk_kda_fwd_intra_sub_chunk_ref.py`（**同一份 GPU 输入**） |
 | 用例矩阵 | `intra_sub_chunk_cases.json`（smoke + GDN 泛化表代表 case） |
-| 布局 | GPU / dump：`BTHD`；NPU：`transpose(1,2)` → `BNSD` |
-| 默认配置 | `gate=lin_mild`，`l2norm=True`，`dtype=bf16`，`akkd` 为 fp32 |
+| 布局 | dump：`BTHD`；NPU：`transpose(1,2)` → `BNSD` |
+| 默认配置 | `gate=lin_mild`，`l2norm=True`，`dtype=bf16`；CPU golden 默认 `fp32` |
 | GPU 限制 | 仅 `chunk_size ∈ {32,64}`；`cs=128` 自动跳过 |
 
-输出：
+输出（同一份 inputs）：
 
-- `aqk`：`[B, T, HV, BT]`（与输入 dtype 一致）
-- `akkd`：`[B, T, HV, BC]`，`BC=16`，**fp32**
+- GPU：`aqk` `[B,T,HV,BT]`，`akkd` `[B,T,HV,BC]`（fp32）
+- CPU：`aqk_cpu` / `akkd_cpu`（同布局；另有独立 `002_*_cpu.pt`）
 
 ---
 
@@ -82,6 +83,8 @@ python3 scripts/run_intra_sub_chunk_dump_cases.py \
 | `--names a,b` | 指定 case |
 | `--skip-done` | 已有 `manifest.json` 则跳过 |
 | `--dtype-save fp32` | 浮点统一存 fp32（体积更大） |
+| `--cpu-dtype fp32\|fp64` | CPU 标杆计算精度（默认 fp32） |
+| `--no-cpu` | 只 dump GPU，不跑 CPU |
 | `--seed N` | 基种子；第 i 个 case 用 `N + i*9973` |
 
 变长 `cu_seqlens` 用与 NPU `prec_gdn_isub` 相同的随机未对齐构造，并写入 `case_meta.json`，便于 NPU 复现。
@@ -95,13 +98,14 @@ python3 scripts/run_intra_sub_chunk_dump_cases.py \
   smoke_mha_fix/
     case_meta.json
     manifest.json
-    001_chunk_kda_fwd_intra_sub_chunk.pt
+    001_chunk_kda_fwd_intra_sub_chunk.pt      # inputs + GPU + CPU
+    002_chunk_kda_fwd_intra_sub_chunk_cpu.pt  # 同 inputs，outputs 仅 CPU
   BSND_noGVA_V128_14/
     ...
   intra_sub_chunk_dump_report.json
 ```
 
-每个 `.pt`：
+`001_*.pt`：
 
 ```python
 {
@@ -112,8 +116,8 @@ python3 scripts/run_intra_sub_chunk_dump_cases.py \
     "q", "k", "g", "beta", "scale",
     "cu_seqlens", "chunk_indices", "chunk_size"
   },
-  "outputs": {"aqk", "akkd"},
-  "meta": {B, T, H, HV, K, seed, cu_seqlens list, ...}
+  "outputs": {"aqk", "akkd", "aqk_cpu", "akkd_cpu"},
+  "meta": {B, T, H, HV, K, seed, cpu_dtype, ...}
 }
 ```
 
@@ -134,9 +138,11 @@ g = inp["g"].transpose(1, 2).contiguous()       # [B,HV,T,K]
 beta = inp["beta"].transpose(1, 2).contiguous() # [B,HV,T]
 aqk_gpu = out["aqk"].transpose(1, 2).contiguous()
 akkd_gpu = out["akkd"].transpose(1, 2).contiguous()
+aqk_cpu = out["aqk_cpu"].transpose(1, 2).contiguous()
+akkd_cpu = out["akkd_cpu"].transpose(1, 2).contiguous()
 ```
 
-用同一份 `inputs` 调 NPU 算子，再与 `aqk_gpu` / `akkd_gpu` 做 `ct.viz` 或相对误差对比。
+用同一份 `inputs` 调 NPU，可同时对标 GPU（`aqk`/`akkd`）与 CPU（`aqk_cpu`/`akkd_cpu`）。
 
 ---
 

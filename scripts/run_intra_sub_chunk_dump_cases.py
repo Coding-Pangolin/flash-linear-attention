@@ -15,7 +15,8 @@ import triton
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 GPU_ROOT = SCRIPT_DIR.parent
-for p in (str(GPU_ROOT), str(SCRIPT_DIR)):
+TEST_DIR = GPU_ROOT / "tests" / "ops"
+for p in (str(GPU_ROOT), str(SCRIPT_DIR), str(TEST_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
@@ -28,13 +29,25 @@ from intra_sub_chunk_case_utils import (  # noqa: E402
     gpu_dump_skip_reason,
     load_cases,
 )
+from chunk_kda_fwd_intra_sub_chunk_ref import (  # noqa: E402
+    chunk_kda_fwd_intra_sub_chunk_ref,
+    prepare_chunk_indices,
+)
 
 OP_NAME = "chunk_kda_fwd_intra_sub_chunk"
+OP_NAME_CPU = "chunk_kda_fwd_intra_sub_chunk_cpu"
+
+_CPU_DTYPE_MAP = {
+    "fp32": torch.float32,
+    "float32": torch.float32,
+    "fp64": torch.float64,
+    "float64": torch.float64,
+}
 
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Batch dump GPU chunk_kda_fwd_intra_sub_chunk I/O from intra_sub_chunk_cases.json"
+        description="Batch dump GPU(+CPU) chunk_kda_fwd_intra_sub_chunk I/O from intra_sub_chunk_cases.json"
     )
     p.add_argument(
         "--cases-file",
@@ -54,6 +67,17 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help="set fp32 to unify saved floating tensors",
     )
+    p.add_argument(
+        "--cpu-dtype",
+        default="fp32",
+        choices=sorted(_CPU_DTYPE_MAP),
+        help="CPU golden compute dtype (default: fp32, aligns with NPU accum)",
+    )
+    p.add_argument(
+        "--no-cpu",
+        action="store_true",
+        help="skip CPU golden dump (GPU I/O only)",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--skip-done", action="store_true")
@@ -65,6 +89,55 @@ def _parse_args() -> argparse.Namespace:
         help="default: <dump-dir>/intra_sub_chunk_dump_report.json",
     )
     return p.parse_args()
+
+
+def _bsnd_to_bthd(x: torch.Tensor) -> torch.Tensor:
+    """[B, H, T, ...] -> [B, T, H, ...]"""
+    return x.transpose(1, 2).contiguous()
+
+
+def _bthd_to_bnsd(x: torch.Tensor) -> torch.Tensor:
+    """[B, T, H, ...] -> [B, H, T, ...]"""
+    return x.transpose(1, 2).contiguous()
+
+
+def run_cpu_intra_sub_chunk(
+    q_bthd: torch.Tensor,
+    k_bthd: torch.Tensor,
+    g_bthd: torch.Tensor,
+    beta_bthd: torch.Tensor,
+    scale: float,
+    chunk_size: int,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    chunk_indices: Optional[torch.Tensor] = None,
+    *,
+    cpu_dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run CPU golden on the same tensors as GPU (GPU layout BTHD in, BTHD out)."""
+    q = _bthd_to_bnsd(q_bthd.detach().cpu())
+    k = _bthd_to_bnsd(k_bthd.detach().cpu())
+    g = _bthd_to_bnsd(g_bthd.detach().cpu())
+    beta = beta_bthd.detach().cpu().transpose(1, 2).contiguous()  # [B,T,HV] -> [B,HV,T]
+    cu = None if cu_seqlens is None else cu_seqlens.detach().cpu().long()
+    idx_flat = None
+    if chunk_indices is not None:
+        idx_flat = chunk_indices.detach().cpu().reshape(-1).long()
+    elif cu is not None:
+        flat = prepare_chunk_indices(cu, chunk_size)
+        idx_flat = torch.tensor(flat, dtype=torch.long)
+
+    aqk_bnsd, akkd_bnsd = chunk_kda_fwd_intra_sub_chunk_ref(
+        q,
+        k,
+        g,
+        beta,
+        scale,
+        chunk_size,
+        cu,
+        idx_flat,
+        dtype=cpu_dtype,
+    )
+    return _bsnd_to_bthd(aqk_bnsd), _bsnd_to_bthd(akkd_bnsd)
 
 
 def _kernel_arg_names(kernel) -> set[str]:
@@ -165,6 +238,7 @@ def _save_dump(
     outputs: dict[str, Any],
     save_fp32: bool,
     fla_file: str,
+    cpu_dtype: Optional[torch.dtype] = None,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     meta_path = out_dir / "case_meta.json"
@@ -179,8 +253,9 @@ def _save_dump(
         "layout": {
             "storage": "BTHD",
             "note": (
-                "q/k [B,T,H,K]; g/aqk [B,T,HV,BT]; akkd [B,T,HV,BC] fp32; "
-                "beta [B,T,HV]. NPU: transpose(1,2) → BNSD; beta [B,T,HV]→[B,HV,T]."
+                "q/k [B,T,H,K]; g/aqk/aqk_cpu [B,T,HV,BT]; akkd/akkd_cpu [B,T,HV,BC]; "
+                "beta [B,T,HV]. GPU akkd is fp32; CPU outputs use cpu_dtype (default fp32). "
+                "NPU: transpose(1,2) → BNSD; beta [B,T,HV]→[B,HV,T]."
             ),
         },
         "inputs": packed_in,
@@ -190,6 +265,10 @@ def _save_dump(
             "fla_file": fla_file,
             "save_fp32": save_fp32,
             "BC": BC,
+            "cpu_dtype": None
+            if cpu_dtype is None
+            else str(cpu_dtype).replace("torch.", ""),
+            "has_cpu_golden": "aqk_cpu" in packed_out,
         },
     }
     pt_name = f"001_{OP_NAME}.pt"
@@ -197,6 +276,27 @@ def _save_dump(
     torch.save(payload, pt_path)
 
     manifest = [{"step": 1, "op": OP_NAME, "path": pt_name}]
+    if "aqk_cpu" in packed_out:
+        # Separate CPU-only payload for loaders that expect one backend per file.
+        cpu_payload = {
+            "op": OP_NAME_CPU,
+            "step": 2,
+            "layout": payload["layout"],
+            "inputs": packed_in,
+            "outputs": {
+                "aqk": packed_out["aqk_cpu"],
+                "akkd": packed_out["akkd_cpu"],
+            },
+            "meta": {
+                **payload["meta"],
+                "backend": "cpu_ref",
+                "source_pt": pt_name,
+            },
+        }
+        cpu_name = f"002_{OP_NAME_CPU}.pt"
+        torch.save(cpu_payload, out_dir / cpu_name)
+        manifest.append({"step": 2, "op": OP_NAME_CPU, "path": cpu_name})
+
     with (out_dir / "manifest.json").open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     return pt_path
@@ -209,6 +309,8 @@ def _run_one_case(
     device: torch.device,
     seed: int,
     dtype_save: str,
+    cpu_dtype: torch.dtype,
+    dump_cpu: bool,
 ) -> dict[str, Any]:
     import fla
 
@@ -229,6 +331,30 @@ def _run_one_case(
             q, k, g, beta, scale, BT, cu_seqlens=cu, chunk_indices=idx
         )
 
+    outputs: dict[str, Any] = {"aqk": aqk, "akkd": akkd}
+    t_cpu = None
+    if dump_cpu:
+        t_c0 = time.time()
+        aqk_cpu, akkd_cpu = run_cpu_intra_sub_chunk(
+            q,
+            k,
+            g,
+            beta,
+            scale,
+            BT,
+            cu_seqlens=cu,
+            chunk_indices=idx,
+            cpu_dtype=cpu_dtype,
+        )
+        t_cpu = time.time() - t_c0
+        outputs["aqk_cpu"] = aqk_cpu
+        outputs["akkd_cpu"] = akkd_cpu
+        meta = {
+            **meta,
+            "cpu_dtype": str(cpu_dtype).replace("torch.", ""),
+            "cpu_backend": "chunk_kda_fwd_intra_sub_chunk_ref",
+        }
+
     out_dir = dump_dir / name
     pt_path = _save_dump(
         out_dir=out_dir,
@@ -243,12 +369,13 @@ def _run_one_case(
             "chunk_indices": idx,
             "chunk_size": BT,
         },
-        outputs={"aqk": aqk, "akkd": akkd},
+        outputs=outputs,
         save_fp32=save_fp32,
         fla_file=str(fla.__file__),
+        cpu_dtype=cpu_dtype if dump_cpu else None,
     )
     elapsed = time.time() - t0
-    return {
+    rec = {
         "name": name,
         "status": "ok",
         "elapsed_s": round(elapsed, 3),
@@ -256,7 +383,13 @@ def _run_one_case(
         "akkd_shape": list(akkd.shape),
         "dump_pt": str(pt_path),
         "dump_dir": str(out_dir),
+        "has_cpu": dump_cpu,
     }
+    if t_cpu is not None:
+        rec["t_cpu_s"] = round(t_cpu, 3)
+        rec["aqk_cpu_shape"] = list(outputs["aqk_cpu"].shape)
+        rec["akkd_cpu_shape"] = list(outputs["akkd_cpu"].shape)
+    return rec
 
 
 def main() -> int:
@@ -272,10 +405,13 @@ def main() -> int:
     )
     selected, gpu_skipped = filter_gpu_dump_cases(selected)
 
+    cpu_dtype = _CPU_DTYPE_MAP[args.cpu_dtype]
+    dump_cpu = not args.no_cpu
     print(f"cases_file={args.cases_file}")
     print(
         f"phase={args.phase} selected={len(selected)} "
-        f"gpu_skipped={len(gpu_skipped)} dump_dir={args.dump_dir} device={args.device}"
+        f"gpu_skipped={len(gpu_skipped)} dump_dir={args.dump_dir} device={args.device} "
+        f"dump_cpu={dump_cpu} cpu_dtype={args.cpu_dtype}"
     )
 
     if args.dry_run:
@@ -327,10 +463,15 @@ def main() -> int:
                 device=device,
                 seed=case_seed,
                 dtype_save=args.dtype_save,
+                cpu_dtype=cpu_dtype,
+                dump_cpu=dump_cpu,
             )
+            extra = ""
+            if rec.get("has_cpu"):
+                extra = f" cpu={rec.get('t_cpu_s')}s"
             print(
                 f"  OK {name} aqk={rec['aqk_shape']} akkd={rec['akkd_shape']} "
-                f"{rec['elapsed_s']}s → {rec['dump_pt']}",
+                f"{rec['elapsed_s']}s{extra} → {rec['dump_pt']}",
                 flush=True,
             )
             results.append(rec)

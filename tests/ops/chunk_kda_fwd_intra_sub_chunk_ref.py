@@ -53,21 +53,35 @@ def chunk_kda_fwd_intra_sub_chunk_ref(
     *,
     dtype: torch.dtype = torch.float64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reference matching Triton safe-gate diagonal path. Inputs are BNSD."""
-    assert q.ndim == 4 and q.shape == k.shape == g.shape
+    """Reference matching Triton safe-gate diagonal path. Inputs are BNSD.
+
+    Supports GVA: q/k [B,H,T,K], g/beta on HV heads (HV % H == 0). q/k are
+    repeated along head dim the same way as Triton ``i_h = i_hv // (HV // H)``.
+    Outputs are [B, HV, T, BT/BC].
+    """
+    assert q.ndim == 4 and q.shape == k.shape
     B, H, T, K = q.shape
-    assert beta.shape == (B, H, T)
+    assert g.ndim == 4 and g.shape[0] == B and g.shape[2] == T and g.shape[3] == K
+    HV = g.shape[1]
+    assert HV >= H and HV % H == 0, f"illegal GVA: H={H} HV={HV}"
+    assert beta.shape == (B, HV, T)
     assert chunk_size in (32, 64, 128)
     BT = chunk_size
     NC = BT // BC
 
-    q_r = q.to(dtype)
-    k_r = k.to(dtype)
+    # Expand q/k to HV heads to match GPU head mapping.
+    if HV != H:
+        rg = HV // H
+        q_r = q.to(dtype).repeat_interleave(rg, dim=1)
+        k_r = k.to(dtype).repeat_interleave(rg, dim=1)
+    else:
+        q_r = q.to(dtype)
+        k_r = k.to(dtype)
     g_r = g.to(dtype)
     beta_r = beta.to(dtype)
 
-    aqk = torch.zeros(B, H, T, BT, dtype=dtype, device=q.device)
-    akkd = torch.zeros(B, H, T, BC, dtype=dtype, device=q.device)
+    aqk = torch.zeros(B, HV, T, BT, dtype=dtype, device=q.device)
+    akkd = torch.zeros(B, HV, T, BC, dtype=dtype, device=q.device)
 
     if cu_seqlens is None:
         # Dense: batch over heads for speed on large H/T.
