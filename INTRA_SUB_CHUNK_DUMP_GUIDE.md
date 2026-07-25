@@ -14,7 +14,9 @@
 | 算子 | Triton `chunk_kda_fwd_kernel_intra_sub_chunk`（`fla/ops/kda/chunk_intra.py`） |
 | CPU 标杆 | `tests/ops/chunk_kda_fwd_intra_sub_chunk_ref.py`（**同一份 GPU 输入**） |
 | 用例矩阵 | `intra_sub_chunk_cases.json`（smoke + GDN 泛化表代表 case） |
-| 布局 | dump：`BTHD`；NPU：`transpose(1,2)` → `BNSD` |
+| 布局 | dump / 生成：`BTHD`；NPU：`transpose(1,2)` → `BNSD` |
+| 随机数 | **默认 CPU RNG**（`rng_on_cpu=True`），再 `.to(cuda)`；与 NPU seed-dual 同 seed 对齐 |
+| 种子 | `seed_i = --seed + case_index * 9973`（`case_index` = 过滤后列表下标） |
 | 默认配置 | `gate=lin_mild`，`l2norm=True`，`dtype=bf16`；CPU golden 默认 `fp32` |
 | GPU 限制 | 仅 `chunk_size ∈ {32,64}`；`cs=128` 自动跳过 |
 

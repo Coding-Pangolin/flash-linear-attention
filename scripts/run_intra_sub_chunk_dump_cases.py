@@ -24,6 +24,7 @@ from intra_sub_chunk_case_utils import (  # noqa: E402
     BC,
     build_intra_sub_chunk_inputs,
     case_dump_done,
+    case_seed,
     filter_cases,
     filter_gpu_dump_cases,
     gpu_dump_skip_reason,
@@ -78,7 +79,12 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="skip CPU golden dump (GPU I/O only)",
     )
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=0, help="base seed; case i uses seed+i*9973")
+    p.add_argument(
+        "--rng-on-cuda",
+        action="store_true",
+        help="sample tensors on CUDA (legacy; breaks seed parity with NPU). Default: CPU RNG",
+    )
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--skip-done", action="store_true")
     p.add_argument("--dry-run", action="store_true")
@@ -311,6 +317,7 @@ def _run_one_case(
     dtype_save: str,
     cpu_dtype: torch.dtype,
     dump_cpu: bool,
+    rng_on_cpu: bool = True,
 ) -> dict[str, Any]:
     import fla
 
@@ -318,7 +325,9 @@ def _run_one_case(
     name = str(case["name"])
     save_fp32 = dtype_save.lower() in ("fp32", "float32", "float")
 
-    bundle = build_intra_sub_chunk_inputs(case, device=device, seed=seed)
+    bundle = build_intra_sub_chunk_inputs(
+        case, device=device, seed=seed, rng_on_cpu=rng_on_cpu
+    )
     meta = bundle["meta"]
     q, k, g, beta = bundle["q"], bundle["k"], bundle["g"], bundle["beta"]
     scale = float(bundle["scale"])
@@ -440,7 +449,7 @@ def main() -> int:
 
     for i, case in enumerate(selected):
         name = str(case["name"])
-        case_seed = args.seed + i * 9973
+        seed_i = case_seed(args.seed, i)
 
         if args.skip_done and case_dump_done(args.dump_dir, name):
             print(f"[{i+1}/{len(selected)}] SKIP {name} (manifest exists)")
@@ -455,16 +464,17 @@ def main() -> int:
             skip += 1
             continue
 
-        print(f"[{i+1}/{len(selected)}] RUN  {name} ...", flush=True)
+        print(f"[{i+1}/{len(selected)}] RUN  {name} seed={seed_i} ...", flush=True)
         try:
             rec = _run_one_case(
                 case,
                 dump_dir=args.dump_dir,
                 device=device,
-                seed=case_seed,
+                seed=seed_i,
                 dtype_save=args.dtype_save,
                 cpu_dtype=cpu_dtype,
                 dump_cpu=dump_cpu,
+                rng_on_cpu=not args.rng_on_cuda,
             )
             extra = ""
             if rec.get("has_cpu"):

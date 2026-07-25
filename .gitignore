@@ -7,6 +7,7 @@ data
 # bash scripts
 *.sh
 !run_intra_sub_chunk_dump_cases.sh
+!run_intra_sub_chunk_seed_dual.sh
 
 # docs
 docs/_build

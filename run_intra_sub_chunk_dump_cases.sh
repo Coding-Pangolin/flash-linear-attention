@@ -28,8 +28,10 @@ Options:
   --dry-run         list selected cases only
   --include-disabled
   --dtype-save fp32 save all tensors as fp32
+  --seed N          base seed (case i → N+i*9973); CPU RNG by default
   --cpu-dtype D     CPU golden dtype: fp32 (default) | fp64
   --no-cpu          dump GPU I/O only (skip CPU golden)
+  --rng-on-cuda     legacy: sample on CUDA (breaks NPU seed parity)
   -h, --help
 
 Examples:
@@ -48,8 +50,10 @@ while [[ $# -gt 0 ]]; do
     --dry-run) EXTRA_ARGS+=(--dry-run); shift ;;
     --include-disabled) EXTRA_ARGS+=(--include-disabled); shift ;;
     --dtype-save) EXTRA_ARGS+=(--dtype-save "$2"); shift 2 ;;
+    --seed) EXTRA_ARGS+=(--seed "$2"); shift 2 ;;
     --cpu-dtype) EXTRA_ARGS+=(--cpu-dtype "$2"); shift 2 ;;
     --no-cpu) EXTRA_ARGS+=(--no-cpu); shift ;;
+    --rng-on-cuda) EXTRA_ARGS+=(--rng-on-cuda); shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac

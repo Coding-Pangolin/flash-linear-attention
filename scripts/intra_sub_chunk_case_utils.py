@@ -187,15 +187,26 @@ def prepare_chunk_indices_flat(cu_seqlens: torch.Tensor, chunk_size: int) -> lis
     return indices
 
 
+def case_seed(base_seed: int, case_index: int) -> int:
+    """Stable per-case seed shared by GPU dump / NPU seed-dual (must stay in sync)."""
+    return int(base_seed) + int(case_index) * 9973
+
+
 def build_intra_sub_chunk_inputs(
     case: dict[str, Any],
     *,
     device: torch.device,
     seed: int,
+    rng_on_cpu: bool = True,
 ) -> dict[str, Any]:
-    """Build GPU-layout (BTHD) tensors + meta for one dump case."""
+    """Build GPU-layout (BTHD) tensors + meta for one case.
+
+    Default ``rng_on_cpu=True``: sample with CPU RNG then ``.to(device)`` so the
+    same ``seed`` reproduces on NPU hosts (no dump transfer of inputs).
+    """
     torch.manual_seed(seed)
-    if device.type == "cuda":
+    gen_dev = torch.device("cpu") if rng_on_cpu else device
+    if (not rng_on_cpu) and device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
 
     B = int(case["B"])
@@ -210,17 +221,17 @@ def build_intra_sub_chunk_inputs(
     varlen = bool(case.get("varlen", False))
     scale = 1.0 / math.sqrt(K)
 
-    q = torch.randn(B, T, H, K, dtype=dtype, device=device)
-    k = torch.randn(B, T, H, K, dtype=dtype, device=device)
+    q = torch.randn(B, T, H, K, dtype=dtype, device=gen_dev)
+    k = torch.randn(B, T, H, K, dtype=dtype, device=gen_dev)
     if l2norm:
         q = _l2norm_last(q.float()).to(dtype)
         k = _l2norm_last(k.float()).to(dtype)
-    g = _make_gate_bsnd(B, HV, T, K, dtype, gate, device)
-    beta = torch.rand(B, T, HV, dtype=dtype, device=device)
+    g = _make_gate_bsnd(B, HV, T, K, dtype, gate, gen_dev)
+    beta = torch.rand(B, T, HV, dtype=dtype, device=gen_dev)
 
     cu_list: Optional[list[int]] = None
     cu_t: Optional[torch.Tensor] = None
-    idx_gpu: Optional[torch.Tensor] = None
+    idx_t: Optional[torch.Tensor] = None
     if varlen:
         assert B == 1
         n_seq = int(case.get("n_seq", 2))
@@ -229,9 +240,20 @@ def build_intra_sub_chunk_inputs(
         else:
             cu_list = make_random_cu_seqlens(T, n_seq, seed=seed, bt=BT, unaligned=True)
         assert cu_list[0] == 0 and cu_list[-1] == T
-        cu_t = torch.tensor(cu_list, dtype=torch.long, device=device)
+        cu_t = torch.tensor(cu_list, dtype=torch.long, device=gen_dev)
         flat = prepare_chunk_indices_flat(cu_t.cpu(), BT)
-        idx_gpu = torch.tensor(flat, dtype=torch.long, device=device).view(-1, 2).contiguous()
+        idx_t = torch.tensor(flat, dtype=torch.long, device=gen_dev).view(-1, 2).contiguous()
+
+    # Move to target device after RNG (identity if already there).
+    if device.type != gen_dev.type or device.index != gen_dev.index:
+        q = q.to(device)
+        k = k.to(device)
+        g = g.to(device)
+        beta = beta.to(device)
+        if cu_t is not None:
+            cu_t = cu_t.to(device)
+        if idx_t is not None:
+            idx_t = idx_t.to(device)
 
     meta = {
         "name": str(case["name"]),
@@ -250,6 +272,7 @@ def build_intra_sub_chunk_inputs(
         "cu_seqlens": cu_list,
         "scale": scale,
         "seed": seed,
+        "rng_on_cpu": bool(rng_on_cpu),
         "gpu_layout": "BTHD",
         "npu_layout_hint": "transpose(1,2) → BNSD for q/k/g/aqk/akkd; beta [B,T,HV]→[B,HV,T]",
         "op": "chunk_kda_fwd_intra_sub_chunk",
@@ -262,6 +285,6 @@ def build_intra_sub_chunk_inputs(
         "scale": scale,
         "chunk_size": BT,
         "cu_seqlens": cu_t,
-        "chunk_indices": idx_gpu,
+        "chunk_indices": idx_t,
         "meta": meta,
     }
