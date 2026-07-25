@@ -105,7 +105,8 @@ def run_gpu_sub_chunk(
 
     B, T, H, K = k_bsnd.shape
     HV = g_bsnd.shape[2]
-    assert H == HV, "this dual script is MHA-only (H == HV)"
+    if HV < H or HV % H != 0:
+        raise ValueError(f"illegal GVA: H={H} HV={HV}")
     BT = chunk_size
     if BT not in (32, 64):
         raise ValueError(f"GPU kernel only supports chunk_size 32/64, got {BT}")
@@ -464,6 +465,7 @@ def main() -> None:
         sample_count=args.sample_count,
         viz_dir=args.viz_dir,
         diagnose=args.diagnose,
+        l2norm=not args.no_l2norm,
     )
 
     if all(v is not None for v in (args.B, args.H, args.T, args.K, args.BT)):
