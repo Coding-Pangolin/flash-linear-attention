@@ -33,6 +33,11 @@
 * 一次调用 = 一个窗口(一个 part); hm 形状 [HV, K, V+K], 左 V 列是 h, 右 K 列是 m
 * hm 为 FP32; h 进 dot 前降到 BF16, v_new 也降 BF16, m 的链在 FP32 内累加
 * cu_seqlens 传 [0, T] 与上游 CP 路径一致(该路径恒走 varlen 分支), 传 None 走定长分支
+
+输入按 delta 规则构造: k 沿 head 维单位化, w = beta*k(beta ~ U(0, --beta-scale)),
+bg = gamma*k。若直接用独立随机的 w, k^T w 的谱范数远大于 1, 递推会在几十个 chunk 内
+发散成 NaN(计时不受影响, 但参考输出作废)。可用 --beta-scale / --decay-per-chunk /
+--bg-scale 调节, 脚本会在输出非有限时给出警告。
 """
 
 from __future__ import annotations
@@ -85,25 +90,18 @@ def tf32_supported() -> bool:
 
 
 # ------------------------------------------------------------------ 输入构造
-def make_decay_2d(gen, T, H, BT, device, dtype=torch.float32):
-    """base-2 的 chunk 内累积对数衰减, 形状 [T, H]。"""
-    x = torch.rand(T, H, generator=gen, dtype=torch.float32) * (-0.05)
+def make_decay(gen, T, shape, BT, device, decay_per_chunk, dtype=torch.float32):
+    """base-2 的 chunk 内累积对数衰减, 形状 [T, *shape]。
+
+    每个 chunk 的总衰减约 exp2(-decay_per_chunk), 逐 token 有小幅随机波动且严格单调递减。
+    """
+    d = decay_per_chunk / BT
+    x = -d * (1.0 + torch.rand(T, *shape, generator=gen, dtype=torch.float32) * 0.5)
     nt = (T + BT - 1) // BT
     pad = nt * BT - T
     if pad:
-        x = torch.cat([x, torch.zeros(pad, H, dtype=torch.float32)], dim=0)
-    x = x.view(nt, BT, H).cumsum(dim=1).reshape(-1, H)[:T]
-    return x.contiguous().to(device=device, dtype=dtype)
-
-
-def make_decay_3d(gen, T, H, K, BT, device, dtype=torch.float32):
-    """逐 K 维的 base-2 chunk 内累积对数衰减, 形状 [T, H, K]。"""
-    x = torch.rand(T, H, K, generator=gen, dtype=torch.float32) * (-0.05)
-    nt = (T + BT - 1) // BT
-    pad = nt * BT - T
-    if pad:
-        x = torch.cat([x, torch.zeros(pad, H, K, dtype=torch.float32)], dim=0)
-    x = x.view(nt, BT, H, K).cumsum(dim=1).reshape(-1, H, K)[:T]
+        x = torch.cat([x, torch.zeros(pad, *shape, dtype=torch.float32)], dim=0)
+    x = x.view(nt, BT, *shape).cumsum(dim=1).reshape(-1, *shape)[:T]
     return x.contiguous().to(device=device, dtype=dtype)
 
 
@@ -117,21 +115,37 @@ def build_case(a, device):
     if a.variant in ("gk", "dplr") and a.hk != a.hv:
         print(f"[warn] {a.variant} 路径要求 HK==HV, 已把 HK 从 {a.hk} 改为 {a.hv}")
 
-    def rnd(*shape, dt=bf16):
-        return torch.randn(*shape, generator=gen, dtype=torch.float32) \
-            .to(device=device, dtype=dt).contiguous()
+    def to_dev(x, dt=bf16):
+        return x.to(device=device, dtype=dt).contiguous()
 
-    k = rnd(T, HK, K)
-    w = rnd(T, HK, K) if use_bg else rnd(T, HV, K)
-    u = rnd(T, HV, V)
-    v = rnd(T, HV, V) if use_bg else u          # GDN/KDA 下 v 复用 u
-    g = make_decay_2d(gen, T, HV, BT, device) if a.variant == "g" else None
-    gk = None if a.variant == "g" else make_decay_3d(gen, T, HV, K, BT, device)
-    bg = rnd(T, HK, K) if use_bg else None
+    # k 沿 head 维单位化, w = beta * k: 这样 delta 规则的状态更新是收缩的。
+    # 直接用独立随机 w 会让 k^T w 的谱范数远大于 1, 递推在几十个 chunk 内就发散成 NaN。
+    k = torch.nn.functional.normalize(torch.randn(T, HK, K, generator=gen), dim=-1)
+    idx = torch.arange(HV) // max(1, HV // HK)
+
+    if use_bg:
+        beta = torch.rand(T, HK, 1, generator=gen) * a.beta_scale
+        w = beta * k
+        bg = (torch.rand(T, HK, 1, generator=gen) * a.bg_scale) * k
+        u = to_dev(torch.randn(T, HV, V, generator=gen))
+        v = to_dev(torch.randn(T, HV, V, generator=gen))
+    else:
+        beta = torch.rand(T, HV, 1, generator=gen) * a.beta_scale
+        w = beta * k[:, idx, :]
+        bg = None
+        u = to_dev(torch.randn(T, HV, V, generator=gen))
+        v = u                                  # GDN/KDA 下 v 复用 u
+
+    g = make_decay(gen, T, (HV,), BT, device, a.decay_per_chunk) \
+        if a.variant == "g" else None
+    gk = None if a.variant == "g" \
+        else make_decay(gen, T, (HV, K), BT, device, a.decay_per_chunk)
     hm = torch.zeros(HV, K, V + K, dtype=f32, device=device)
     cu = torch.tensor([0, T], dtype=torch.int32, device=device) if a.varlen else None
 
-    return dict(k=k, v=v, w=w, g=g, gk=gk, bg=bg, u=u, hm=hm, cu_seqlens=cu,
+    return dict(k=to_dev(k), v=v, w=to_dev(w), g=g, gk=gk,
+                bg=(to_dev(bg) if bg is not None else None),
+                u=u, hm=hm, cu_seqlens=cu,
                 H=HK, HV=HV, K=K, V=V, T=T, BT=BT), use_bg
 
 
@@ -224,6 +238,12 @@ def parse_args(argv):
     ap.add_argument("--v", type=int, default=None, dest="vdim", help="value 维 V")
     ap.add_argument("--bt", type=int, default=None, help="chunk_size")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--beta-scale", type=float, default=0.02,
+                    help="w = beta*k 的 beta 上界; 直接决定 delta 规则的收缩程度")
+    ap.add_argument("--decay-per-chunk", type=float, default=0.013,
+                    help="每个 chunk 的 log2 总衰减量, chunk 内衰减率 = exp2(-该值)")
+    ap.add_argument("--bg-scale", type=float, default=0.02,
+                    help="仅 DPLR: bg = gamma*k 的 gamma 上界")
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--repeat", type=int, default=100)
     ap.add_argument("--device", type=int, default=0)
@@ -338,15 +358,19 @@ def main(argv=None):
             results[prec]["cupti_top"] = [
                 dict(key=k, count=c, avg_us=u) for k, c, u in cupti[:6]]
 
-    if tensors["hm"].numel():
-        hm = tensors["hm"]
-        h = hm[:, :, :V]
-        m = hm[:, :, V:]
-        print()
-        print(f"输出检查     : finite={bool(torch.isfinite(hm).all().item())}  "
-              f"|h|max={h.abs().max().item():.4e}  |m|max={m.abs().max().item():.4e}")
+    hm = tensors["hm"]
+    finite = bool(torch.isfinite(hm).all().item())
+    print()
+    print(f"输出检查     : finite={finite}  "
+          f"|h|max={hm[:, :, :V].abs().max().item():.4e}  "
+          f"|m|max={hm[:, :, V:].abs().max().item():.4e}")
+    if not finite:
+        print("  [WARN] 输出含非有限值: 该 case 的递推发散了。")
+        print("         计时结果仍然可用(本 kernel 无数据相关分支, NaN 不改变吞吐),")
+        print("         但 hm 不能作为参考输出。请调小 --beta-scale 或调大")
+        print("         --decay-per-chunk 后重跑。")
 
-    if a.save_io and results:
+    if a.save_io and results and finite:
         os.makedirs(a.save_io, exist_ok=True)
         payload = {name: (t.cpu() if torch.is_tensor(t) else t)
                    for name, t in tensors.items()}

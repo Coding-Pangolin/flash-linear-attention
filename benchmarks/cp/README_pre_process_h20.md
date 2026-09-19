@@ -147,7 +147,32 @@ kernel[grid](k=, v=, w=, g=, gk=, bg=, u=, hm=, cu_seqlens=, T=,
 `hm` 形状 `[HV, K, V+K]`，FP32。`h` 在进 dot 前降到 BF16，`v_new` 也降到 BF16，
 `m` 的链在 FP32 内累加——这三个舍入点是精度对齐的关键。
 
-## 11. 已知限制
+## 11. 输入生成与发散（首次运行踩过的坑）
+
+脚本按 delta 规则的语义构造输入，而不是用独立随机张量：
+
+* `k` 沿 head 维单位化；
+* `w = beta * k`，`beta ~ U(0, --beta-scale)`（默认 `0.02`）；
+* `bg = gamma * k`（仅 DPLR），`gamma ~ U(0, --bg-scale)`（默认 `0.02`）；
+* gate 按 chunk 累积，每 chunk 总 log2 衰减 `--decay-per-chunk`（默认 `0.013`，
+  即 chunk 内衰减率 `exp2(-0.013) ≈ 0.991`，整窗口 176 个 chunk 后累计约 `0.2`）。
+
+**为什么不能直接用独立随机的 `w`**：状态更新是
+
+```
+h ← decay·h + kᵀ(v − w h) = (decay·I − kᵀw)·h + kᵀv
+```
+
+`w` 若与 `k` 无关地随机采样，`kᵀw` 的谱范数会远大于 1，递推在几十个 chunk 内就发散成
+`NaN`（脚本第一版正是如此，输出 `finite=False`）。
+
+发散时**计时结果仍然可用**：这个 kernel 没有数据相关分支，NaN 不改变 tensor core 吞吐。
+但 `hm` 不能当参考输出——脚本在输出非有限时会给出警告，并且**不写 `case.pt`**。
+
+参数不合适时的调整方向：调小 `--beta-scale`（更收缩），或调大 `--decay-per-chunk`
+（衰减更快）。
+
+## 12. 已知限制
 
 * **不走 `chunk_gated_delta_rule_fwd_h_pre_process` 包裹**：本脚本只量单次 kernel，
   不含 `all_gather_into_tensor` 与 `merge_fwd_bwd_kernel`。若目标口径是「一个 rank 的
@@ -156,7 +181,7 @@ kernel[grid](k=, v=, w=, g=, gk=, bg=, u=, hm=, cu_seqlens=, T=,
 * 会触发 `@triton.autotune`（6 个 config），第一次调用较慢；脚本的 warmup 已覆盖，
   `summary` 报的是 autotune 之后的稳态值。
 
-## 12. 回贴格式
+## 13. 回贴格式
 
 ```
 case=model-gk variant=gk T=11264 HK=32 HV=32 K=128 V=128 BT=64 prec=default
