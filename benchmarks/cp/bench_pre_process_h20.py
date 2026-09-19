@@ -19,6 +19,8 @@
     python -m benchmarks.cp.bench_pre_process_h20 --case model-gk --t 2816   # 自定义窗口长度
     python -m benchmarks.cp.bench_pre_process_h20 --case model-gk --torch-profiler
     python -m benchmarks.cp.bench_pre_process_h20 --case model-gk --save-io ./case_gk
+    python -m benchmarks.cp.bench_pre_process_h20 --case model-gk --half h   # 只跑 h 半边
+    python -m benchmarks.cp.bench_pre_process_h20 --case model-gk --half m   # 只跑 m 半边
 
 口径说明
 --------
@@ -140,7 +142,9 @@ def build_case(a, device):
         if a.variant == "g" else None
     gk = None if a.variant == "g" \
         else make_decay(gen, T, (HV, K), BT, device, a.decay_per_chunk)
-    hm = torch.zeros(HV, K, V + K, dtype=f32, device=device)
+    # half=m 时把 V 置 0, stride_hm_kv 退化成 K, 因此 hm 只需要 K 列
+    eff_v = 0 if a.half == "m" else V
+    hm = torch.zeros(HV, K, eff_v + K, dtype=f32, device=device)
     cu = torch.tensor([0, T], dtype=torch.int32, device=device) if a.varlen else None
 
     return dict(k=to_dev(k), v=v, w=to_dev(w), g=g, gk=gk,
@@ -150,16 +154,22 @@ def build_case(a, device):
 
 
 # -------------------------------------------------------------------- MAC 估算
-def estimate_macs(T, HV, K, V, BT, use_bg):
+def estimate_macs(T, HV, K, V, BT, use_bg, half="both"):
     """按上游列块分流的实际计算量估 MAC(含 m 半边 M_c 的重复计算)。"""
     bs = 32 if K <= 64 else 64
     nt = (T + BT - 1) // BT
     n_h = (V + bs - 1) // bs
     n_m = (K + bs - 1) // bs
-    per_head = n_h * (BT * K * bs + K * BT * bs) + n_m * (K * BT * K) + K * K * V
+    mac_h = n_h * (BT * K * bs + K * BT * bs)
     if use_bg:
-        per_head += n_h * (K * BT * bs)
-    return per_head * nt * HV
+        mac_h += n_h * (K * BT * bs)
+    # m 半边: kw 每个 m program 重算一遍(与列块无关), M@m 覆盖 K 列
+    mac_m = n_m * (K * BT * K) + K * K * K
+    if half == "h":
+        return mac_h * nt * HV
+    if half == "m":
+        return mac_m * nt * HV
+    return (mac_h + mac_m) * nt * HV
 
 
 # --------------------------------------------------------------------- 计时
@@ -244,6 +254,9 @@ def parse_args(argv):
                     help="每个 chunk 的 log2 总衰减量, chunk 内衰减率 = exp2(-该值)")
     ap.add_argument("--bg-scale", type=float, default=0.02,
                     help="仅 DPLR: bg = gamma*k 的 gamma 上界")
+    ap.add_argument("--half", choices=("both", "h", "m"), default="both",
+                    help="只跑 h 半边或 m 半边, 用于拆解串行链成本; "
+                         "m 半边通过把 V 置 0 实现(见 README 第 12 节)")
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--repeat", type=int, default=100)
     ap.add_argument("--device", type=int, default=0)
@@ -293,18 +306,29 @@ def main(argv=None):
     HV, T, HK = tensors["HV"], tensors["T"], tensors["H"]
     BK1 = triton.next_power_of_2(K)
     BS = 32 if K <= 64 else 64
-    grid = (triton.cdiv(V, BS) + triton.cdiv(K, BS), HV)
+
+    # half=m: 把 V 置 0 -> cdiv(V,BS)=0, 所有 program 都落到 m 半边。
+    # 这是测量手段(只改 constexpr 与 grid), 不改变 m 半边的计算量: m 侧不读 v/u,
+    # 每个 program 的工作量只由 K/BT/BLOCK_SIZE 决定。
+    if a.half == "h":
+        v_arg, grid, half_note = V, (triton.cdiv(V, BS), HV), "只跑 h 半边"
+    elif a.half == "m":
+        v_arg, grid, half_note = 0, (triton.cdiv(K, BS), HV), "只跑 m 半边(V=0)"
+    else:
+        v_arg, half_note = V, "两半都跑(上游默认)"
+        grid = (triton.cdiv(V, BS) + triton.cdiv(K, BS), HV)
 
     print("=" * 78)
     print("H20 baseline: fla-org pre_process_fwd_kernel_merged")
     print("=" * 78)
     print(f"device       : {prop.name}  SMs={prop.multi_processor_count}")
     print(f"torch/triton : {torch.__version__} / {triton.__version__}")
-    print(f"case         : {a.case}  variant={a.variant}  varlen={a.varlen}")
+    print(f"case         : {a.case}  variant={a.variant}  varlen={a.varlen}  "
+          f"half={a.half} ({half_note})")
     print(f"shape        : T={T} HK={HK} HV={HV} K={K} V={V} BT={BT} seed={a.seed}")
     print(f"grid         : {grid}   BLOCK_SIZE={BS}  BK1={BK1}  "
           f"IS_TF32_SUPPORTED={tf32_supported()}")
-    macs = estimate_macs(T, HV, K, V, BT, use_bg)
+    macs = estimate_macs(T, HV, K, V, BT, use_bg, a.half)
     print(f"MAC/call     : {macs/1e6:.2f} M  ({macs*2/1e9:.2f} GFLOP, 含上游列块冗余)")
     print(f"hm           : {tuple(tensors['hm'].shape)} {tensors['hm'].dtype}")
     print()
@@ -320,7 +344,7 @@ def main(argv=None):
                 k=tensors["k"], v=tensors["v"], w=tensors["w"],
                 g=tensors["g"], gk=tensors["gk"], bg=tensors["bg"], u=tensors["u"],
                 hm=tensors["hm"], cu_seqlens=tensors["cu_seqlens"], T=T,
-                H=HK, HV=HV, K=K, V=V, BT=BT, BK1=BK1, BLOCK_SIZE=BS,
+                H=HK, HV=HV, K=K, V=v_arg, BT=BT, BK1=BK1, BLOCK_SIZE=BS,
                 MULTI_SEQS=False, AFFINE_CHAIN_PRECISION=arg_prec,
             )
 
@@ -360,10 +384,11 @@ def main(argv=None):
 
     hm = tensors["hm"]
     finite = bool(torch.isfinite(hm).all().item())
+    h_part, m_part = hm[:, :, :v_arg], hm[:, :, v_arg:]
     print()
     print(f"输出检查     : finite={finite}  "
-          f"|h|max={hm[:, :, :V].abs().max().item():.4e}  "
-          f"|m|max={hm[:, :, V:].abs().max().item():.4e}")
+          f"|h|max={h_part.abs().max().item() if h_part.numel() else float('nan'):.4e}  "
+          f"|m|max={m_part.abs().max().item() if m_part.numel() else float('nan'):.4e}")
     if not finite:
         print("  [WARN] 输出含非有限值: 该 case 的递推发散了。")
         print("         计时结果仍然可用(本 kernel 无数据相关分支, NaN 不改变吞吐),")
@@ -390,7 +415,7 @@ def main(argv=None):
         print("summary(可直接回贴)")
         print("=" * 78)
         for prec, r in results.items():
-            print(f"case={a.case} variant={a.variant} T={T} HK={HK} HV={HV} "
+            print(f"case={a.case} variant={a.variant} half={a.half} T={T} HK={HK} HV={HV} "
                   f"K={K} V={V} BT={BT} prec={prec} "
                   f"p50={r['p50']*1000:.1f}us p90={r['p90']*1000:.1f}us "
                   f"min={r['min']*1000:.1f}us")

@@ -172,7 +172,32 @@ h ← decay·h + kᵀ(v − w h) = (decay·I − kᵀw)·h + kᵀv
 参数不合适时的调整方向：调小 `--beta-scale`（更收缩），或调大 `--decay-per-chunk`
 （衰减更快）。
 
-## 12. 已知限制
+## 12. 半边拆解（`--half`）
+
+上游 kernel 用 `i_col * BLOCK_SIZE < V` 把同一 grid 里的 program 分成两半：h 半
+（写 `hm[:, :, 0:V]`）与 m 半（写 `hm[:, :, V:V+K]`）。两半**没有数据依赖**——m 半不读
+`v/u`，也不需要 `h`——但共用同一批输入，所以想知道 176 步串行链的成本怎么分，必须分别只跑一半。
+
+```bash
+python -m benchmarks.cp.bench_pre_process_h20 --case model-gk --half h
+python -m benchmarks.cp.bench_pre_process_h20 --case model-gk --half m
+python -m benchmarks.cp.bench_pre_process_h20 --case model-gk            # 两半都跑(默认)
+```
+
+实现方式：
+
+* `--half h`：grid 第一维只留 `cdiv(V, BS)`，所有 program 都落进 h 半。kernel 的编译产物
+  与默认**完全一致**（只改 grid），所以这半边是干净的测量。
+* `--half m`：把 `V` 这个 constexpr 置 0，于是 `cdiv(0, BS) = 0`，第一个 program 起就落在
+  m 半。m 半每个 program 的工作量只由 `K / BT / BLOCK_SIZE` 决定、与 `V` 无关，所以计算量不变。
+  **但 `V=0` 会让编译器把 h 分支判成死代码**，可能降低寄存器压力，因此 `--half m` 量到的是
+  偏乐观的下界。
+* 自检：`t(both)` 应接近 `t(h) + t(m)`；差得多说明拆解不可信。
+
+> 拆解结果**只作参考**。它说明的是 H20 上这条串行链的成本结构，**不能直接搬到昇腾**。
+> 设计要按昇腾的 AIC/AIV 配比（950PR 是 Cube 28 / Vector 56）、L0/L1/UB 容量和同步开销重新算。
+
+## 13. 已知限制
 
 * **不走 `chunk_gated_delta_rule_fwd_h_pre_process` 包裹**：本脚本只量单次 kernel，
   不含 `all_gather_into_tensor` 与 `merge_fwd_bwd_kernel`。若目标口径是「一个 rank 的
@@ -181,7 +206,7 @@ h ← decay·h + kᵀ(v − w h) = (decay·I − kᵀw)·h + kᵀv
 * 会触发 `@triton.autotune`（6 个 config），第一次调用较慢；脚本的 warmup 已覆盖，
   `summary` 报的是 autotune 之后的稳态值。
 
-## 13. 回贴格式
+## 14. 回贴格式
 
 ```
 case=model-gk variant=gk T=11264 HK=32 HV=32 K=128 V=128 BT=64 prec=default
