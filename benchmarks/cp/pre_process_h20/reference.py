@@ -13,14 +13,19 @@
 * k 的 head 维按 i_h // (HV // HK) 展开到 HV 个 value head
 * 输出 hm[HV, K, V+K]: 左 [0,V) 是 h, 右 [V, V+K) 是 m
 
-被刻意保留的三个舍入点(改变它们会显著改变结果, 因此属于接口契约的一部分)
-------------------------------------------------------------------------
-1. `h` 在进入 `w @ h` 之前先降到输入 dtype(BF16)
-2. `v_new` 在进入 `k^T @ v_new` 之前先降到输入 dtype(BF16)
-3. `m` 的链式乘 `M_c @ m` 在 FP32 内进行, 每个 chunk 更新后回落到 FP32
-   (上游用 input_precision="ieee"; 其余部分用 accum_dtype 高精度累加)
+契约的数值精度(改变它们会显著改变结果, 因此属于接口契约的一部分)
+----------------------------------------------------------------
+1. 输入为 BF16; 累加为 **FP32** —— 上游 kernel 的 h/m 累加器都是
+   `tl.zeros(..., dtype=tl.float32)`, 所有 `tl.dot` 都往 FP32 累加器里累加,
+   因此 `accum_dtype` 默认取 `float32`, 与 kernel 声明的精度一致
+2. `h` 在进入 `w @ h` 之前先降到输入 dtype(BF16)
+3. `v_new` 在进入 `k^T @ v_new` 之前先降到输入 dtype(BF16)
+4. `m` 的链式乘 `M_c @ m` 每个 chunk 更新后回落到 FP32(上游 `input_precision="ieee"`)
 
-除上述三点外, 全部累加使用 `accum_dtype`(默认 float64), 以保证标杆精度高于实现。
+把 `accum_dtype` 换成 `float64` 并把三个开关都关掉, 就得到"纯数学"版本
+(`calibrate_reference.py` 用它做灵敏度对照)。**只有"契约"版本用于精度验收**:
+kernel 的 h 累加器是 FP32, 用 FP64 基准会让任何忠实的实现都平白多出 ~9e-3 的
+绝对偏差(2026-09-20 与 H20 `ieee` 实测对齐时测得 9.371e-03)。
 """
 
 from __future__ import annotations
@@ -38,9 +43,10 @@ REFERENCE_CONTRACT = {
     "layout": "token-major [T, H, D]",
     "gate_units": "log2 (exp2 衰减, chunk 内累积)",
     "rounding_points": [
+        "accumulation in float32 (kernel's h/m accumulators are tl.float32)",
         "h -> input dtype before w @ h",
         "v_new -> input dtype before k^T @ v_new",
-        "M_c @ m accumulated in float32 per chunk",
+        "M_c @ m rounded back to float32 per chunk",
     ],
     "outputs": ["hm[HV, K, V+K] = [h | m]"],
 }
@@ -63,7 +69,7 @@ def pre_process_fwd_kernel_merged(
     u: Optional[torch.Tensor] = None,
     chunk_size: int = 64,
     cu_seqlens: Optional[Sequence[int]] = None,
-    accum_dtype: torch.dtype = torch.float64,
+    accum_dtype: torch.dtype = torch.float32,
     round_h_to_input_dtype: bool = True,
     round_v_new_to_input_dtype: bool = True,
     round_affine_chain_to_float32: bool = True,
@@ -190,7 +196,7 @@ def _self_test() -> None:
     hm = pre_process_fwd_kernel_merged(k, v, w, g=g)
     assert hm.shape == (HV, K, V + K), hm.shape
     assert torch.isfinite(hm).all(), "self test produced non-finite values"
-    assert hm.dtype == torch.float64
+    assert hm.dtype == torch.float32, "default accum_dtype must match the kernel (fp32)"
     print(f"self test OK: {tuple(hm.shape)} {hm.dtype} "
           f"|h|max={hm[:, :, :V].abs().max():.4e} |m|max={hm[:, :, V:].abs().max():.4e}")
 

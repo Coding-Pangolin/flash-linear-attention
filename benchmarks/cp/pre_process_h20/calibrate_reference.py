@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""02 阶段值域校准: 为 precision-policy.json 定 max_abs_limit / rtol。
+"""02 阶段值域校准: 为 precision-policy.json 定 max_abs_limit / rtol / atol。
 
 做两件事:
-1. 量化"契约舍入点"的影响: 标杆(复刻三个舍入点, fp64 累加) vs 纯 fp64
-2. 与一份**独立实现**(float32 累加、不同代码路径)对齐, 量化"复刻了舍入点但累加顺序
-   不同"的实现与标杆之间正常的偏差量级 —— 这正是 NPU 实现对标杆的预期偏差
+1. 量化"契约精度"的影响: 契约标杆(FP32 累加 + 三处舍入点) vs 纯数学 FP64 —— 即
+   "如果实现不遵守契约会差多少"
+2. 量化"同为 FP32、只是累加顺序不同"的散布(按 16 个 token 分组累加, 模拟 NPU 的
+   Cube tile 累加) —— 这正是**任何**正确实现对标杆的预期偏差量级, 直接决定 atol
 
 用法: python calibrate_reference.py --t 11264 --bt 64 --k 128 --v 128
 """
@@ -62,44 +63,38 @@ def build_case(T, BT, HK, HV, K, V, beta_scale=0.02, decay_per_chunk=0.013,
                 bg=bg.bfloat16(), g=decay((HV,)), gk=decay((HV, K)))
 
 
-def independent(k, v, w, u, g, gk, bg, BT, K, V, use_g, use_gk, use_bg):
-    """独立实现: float32 累加, 与 reference.py 不同的循环/广播写法。"""
+def tiled(k, v, w, gk, bg, BT, K, V, tile=16, accum=torch.float32):
+    """与标杆同语义同精度, 但 h 的 token 累加按 `tile` 分组后再相加。
+
+    用来量化"同为 FP32 累加、只是累加顺序不同"的正常散布 —— 这正是 NPU 的
+    Cube tile 累加相对标杆的预期偏差量级。
+    """
     T = k.shape[0]
     HV, HK = v.shape[1], k.shape[1]
     idx = torch.arange(HV) // (HV // HK)
-    h = torch.zeros(HV, K, V, dtype=torch.float32)
-    m = torch.eye(K, dtype=torch.float32).repeat(HV, 1, 1)
+    use_bg = bg is not None
+    dt = accum
+    h = torch.zeros(HV, K, V, dtype=dt)
+    m = torch.eye(K, dtype=dt).repeat(HV, 1, 1)
     for c in range(cdiv(T, BT)):
         lo, hi = c * BT, min((c + 1) * BT, T)
         o = torch.arange(lo, hi)
         last = hi - 1
-        kc = k[o][:, idx, :].float()
-        wc = (w[o][:, idx, :] if use_bg else w[o]).float()
-        vc, uc = v[o].float(), u[o].float()
-        v_new = (torch.einsum("thk,hkv->thv", wc, h.to(torch.bfloat16).float()) + uc
-                 if use_bg else
-                 vc - torch.einsum("thk,hkv->thv", wc, h.to(torch.bfloat16).float()))
-        if use_g:
-            gl, gs = g[last], g[o]
-            v_new = v_new * torch.exp2(gl[None, :] - gs).unsqueeze(-1)
-            h = h * torch.exp2(gl)[:, None, None]
-        if use_gk:
-            h = h * torch.exp2(gk[last])[:, :, None]
-        h = h + torch.einsum("thk,thv->hkv", kc, v_new.to(torch.bfloat16).float())
-        if use_bg:
-            h = h + torch.einsum("thk,thv->hkv", bg[o][:, idx, :].float(),
-                                 vc.to(torch.bfloat16).float())
-        left = bg[o][:, idx, :].float() if use_bg else kc
-        if use_g:
-            left = left * torch.exp2(g[last][None, :] - g[o]).unsqueeze(-1)
-        kw = torch.einsum("thk,thj->hkj", left.to(torch.bfloat16).float(),
-                          wc.to(torch.bfloat16).float())
-        if use_g:
-            diag = torch.eye(K).repeat(HV, 1, 1) * torch.exp2(g[last])[:, None, None]
-        else:
-            diag = torch.diag_embed(torch.exp2(gk[last]))
-        M = (diag + kw) if use_bg else (diag - kw)
-        m = M @ m
+        kc = k[o][:, idx, :].to(dt)
+        wc = (w[o][:, idx, :] if use_bg else w[o]).to(dt)
+        vc = v[o].to(dt)
+        # 与 kernel 一致: 先用"未按本 chunk 衰减"的 h 算 v_decay, 再衰减 h
+        v_new = vc - torch.einsum("thk,hkv->thv", wc, h.to(k.dtype).to(dt))
+        h = h * torch.exp2(gk[last].to(dt))[:, :, None]
+        vd = v_new.to(k.dtype).to(dt)
+        acc = None
+        for t0 in range(0, o.numel(), tile):
+            part = torch.einsum("thk,thv->hkv", kc[t0:t0 + tile], vd[t0:t0 + tile])
+            acc = part if acc is None else acc + part
+        h = h + acc
+        kw = torch.einsum("thk,thj->hkj", kc.to(k.dtype).to(dt), wc.to(k.dtype).to(dt))
+        M = torch.diag_embed(torch.exp2(gk[last].to(dt))) - kw
+        m = ((M @ m).to(torch.float32)).to(dt)
     return torch.cat([h, m], dim=-1)
 
 
@@ -119,7 +114,7 @@ def main() -> None:
     print(f"case: T={a.t} BT={a.bt} K={a.kdim} V={a.vdim} "
           f"NT={cdiv(a.t, a.bt)}  beta=0.02 decay/ck=0.013 bg=0.02")
     print(f"{'variant':<16}{'|h|max':>9}{'|m|max':>9}"
-          f"{'contract vs pure fp64':>26}{'independent impl':>26}")
+          f"{'契约 vs 纯FP64':>24}")
     for hk, hv in ((32, 32), (16, 32)):
         for variant in ("g", "gk", "dplr"):
             c = build_case(a.t, a.bt, hk, hv, a.kdim, a.vdim)
@@ -129,17 +124,31 @@ def main() -> None:
                       chunk_size=a.bt, cu_seqlens=(0, a.t))
             base = ref(c["k"], c["v"], c["w"], **gate, **kw)
             pure = ref(c["k"], c["v"], c["w"], **gate, **kw,
+                       accum_dtype=torch.float64,
                        round_h_to_input_dtype=False,
                        round_v_new_to_input_dtype=False,
                        round_affine_chain_to_float32=False)
-            ind = independent(c["k"], c["v"], c["w"], c["u"], c["g"], c["gk"], c["bg"],
-                              a.bt, a.kdim, a.vdim, use_g, use_gk, use_bg)
-            r1, r2 = rel(base, pure), rel(base, ind)
+            r1 = rel(base, pure)
             print(f"HK={hk:<2d} HV={hv:<2d} {variant:<6s}"
                   f"{base[:, :, :a.vdim].abs().max():9.3f}"
                   f"{base[:, :, a.vdim:].abs().max():9.4f}"
-                  f"   abs={r1[0]:.3e} rel={r1[1]:.2e}"
-                  f"    abs={r2[0]:.3e} rel={r2[1]:.2e}")
+                  f"   abs={r1[0]:.3e} rel={r1[1]:.2e}")
+
+    # 同为 FP32、累加顺序不同 —— 决定 atol 的那一项
+    print("\n同为 FP32 累加、只是把 token 累加按 tile 分组(模拟 NPU Cube 的 tile 累加),"
+          " 与契约标杆的偏差:")
+    for hk, hv in ((32, 32), (16, 32)):
+        c = build_case(a.t, a.bt, hk, hv, a.kdim, a.vdim)
+        base = ref(c["k"], c["v"], c["w"], gk=c["gk"],
+                   chunk_size=a.bt, cu_seqlens=(0, a.t))
+        for tile in (16, 8):
+            x = tiled(c["k"], c["v"], c["w"], c["gk"], None, a.bt, a.kdim, a.vdim,
+                      tile=tile)
+            rh = rel(x[:, :, :a.vdim], base[:, :, :a.vdim])
+            rm = rel(x[:, :, a.vdim:], base[:, :, a.vdim:])
+            print(f"  HK={hk:<2d} HV={hv:<2d} gk tile={tile:<2d}"
+                  f"  h_half abs={rh[0]:.3e} rel={rh[1]:.2e}   "
+                  f"m_half abs={rm[0]:.3e} rel={rm[1]:.2e}")
 
 
 if __name__ == "__main__":

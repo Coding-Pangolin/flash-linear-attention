@@ -165,6 +165,14 @@ def main() -> int:
         print(f"{name:<12}{m['elements']:>10}{m['matched_ratio']:>10.6f}"
               f"{m['error_count']:>8}{m['max_abs']:>12.3e}{m['mare']:>12.3e}")
 
+    # h 半边受 bf16(h) 量化不连续的影响, 绝对噪声底约 8e-3, 策略的 atol 必须放宽到该量级;
+    # m 半边不含这种反馈量化, 可以按严格阈值单独复核 —— 这是本算子最强的正确性证据。
+    m_strict = _metrics(actual_np[masks["m_half"]], golden_np[masks["m_half"]],
+                        1e-6, cfg["rtol"])
+    print(f"\n[严格复核] m_half 用 atol=1e-6 / rtol={cfg['rtol']} 复算: "
+          f"matched={m_strict['matched_ratio']:.6f} "
+          f"max_abs={m_strict['max_abs']:.3e} MARE={m_strict['mare']:.3e}")
+
     ok = (overall["matched_ratio"] >= policy["global_matched_ratio"]
           and overall["max_abs"] <= cfg["max_abs_limit"])
     print(f"\n概览: matched_ratio={overall['matched_ratio']:.6f} "
