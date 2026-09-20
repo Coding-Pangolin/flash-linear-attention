@@ -400,7 +400,8 @@ def main(argv=None):
         payload = {name: (t.cpu() if torch.is_tensor(t) else t)
                    for name, t in tensors.items()}
         torch.save(payload, os.path.join(a.save_io, "case.pt"))
-        meta = dict(case=a.case, variant=a.variant, varlen=a.varlen, seed=a.seed,
+        meta = dict(case=a.case, variant=a.variant, half=a.half, varlen=a.varlen,
+                    seed=a.seed,
                     T=T, HK=HK, HV=HV, K=K, V=V, BT=BT,
                     grid=list(grid), block_size=BS, bk1=BK1, macs=macs,
                     device=prop.name, torch=torch.__version__, triton=triton.__version__,

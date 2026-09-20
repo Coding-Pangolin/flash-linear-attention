@@ -5,6 +5,21 @@
 
 采集脚本：[`bench_pre_process_h20.py`](bench_pre_process_h20.py)
 
+> **标杆（CPU golden）与 GPU 对齐工具在 [`pre_process_h20/`](pre_process_h20/README.md)。**
+> 采集时加 `--save-io` 导出 `case.pt`，即可在同一台 GPU 机器上直接完成正确性对齐：
+>
+> ```bash
+> python -m benchmarks.cp.bench_pre_process_h20 --case model-gk --precision ieee \
+>     --warmup 5 --repeat 10 --save-io ./case_gk
+> python benchmarks/cp/pre_process_h20/compare_with_gpu.py \
+>     --case ./case_gk/case.pt \
+>     --policy benchmarks/cp/pre_process_h20/precision-policy.json \
+>     --precision ieee
+> ```
+>
+> 注意：**正确性对齐要用 `--precision ieee`**；`default`（NVIDIA 上是 TF32）适合做性能基线，
+> 不适合对齐（`m` 半边 176 次链式乘会把 TF32 误差累积到 ~1e-1 相对量级）。
+
 ## 1. 这个 kernel 做什么
 
 它是上下文并行（CP, context parallel）场景下 `chunk_gated_delta_rule_fwd_h` 的**前处理**：
