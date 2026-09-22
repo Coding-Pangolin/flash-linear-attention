@@ -26,9 +26,14 @@
 
       每个"需要携带状态"的段会打三行数：
         |gt|max                                      ground truth 的量级
-        噪声基准 = |单调用<cp-precision> - 单调用ieee|  同一支 kernel 不做 merge 时的精度抖动
+        噪声基准A = |单调用<cp-precision> - 单调用ieee|  同一支 kernel 换精度档位的抖动
+        噪声基准B = |同精度拆块复合 - 同精度单调用|     同一支 kernel、同一精度，只把前缀按
+                                                       part 边界拆成多段再前缀复合（= 竞品
+                                                       merge 的语义）后与一次算完的差
         CP 路径  = |init - 单调用ieee|                  竞品 chained-merge 的结果与真值之差
-      判据：CP 路径 ≈ 噪声基准 → 语义一致；差出几个量级 → 竞品在多段 part 下不一致。
+      判据：CP 路径 ≈ 噪声基准B → 语义一致（差异只是"分块口径不同"的 bf16 量化点差异）；
+      差出几个量级 → 竞品在多段 part 下不一致。之所以要有 B 这一项：窗口短的时候
+      |tf32x3 - ieee| 经常正好是 0（tf32x3 精度接近 fp32），拿它当基准判不了事。
       注意 wrapper 不接受 ieee（H20 上只有 tf32 / tf32x3 两条路），所以 CP 路径的精度
       由 --cp-precision 控制，默认 tf32x3（最接近真值）。
 
@@ -274,6 +279,25 @@ def mode_cp(args):
     def seq_start(g):
         return max(s for s in segs if s <= g)
 
+    # 拆块分解基准：同一段前缀，让"同一支 kernel + 同一精度"按 part 边界拆成多个窗口再复合，
+    # 与"一次算完"比。竞品的 merge 就是"前缀复合"，所以这个量才是 CP 路径真正的噪声基准
+    # （|单调用 tf32x3 - 单调用 ieee| 在窗口较短时经常退化成 0，判不了事）。
+    split_points = sorted({k * part_len for k in range(1, T // part_len)})
+
+    def chain_of(lo, hi):
+        hm = run_kernel(t, [lo, hi], False, args.bt, prec=kernel_prec)[0]
+        return hm[:, :, :V].clone(), hm[:, :, V:].clone()
+
+    def compose_prefix(lo, hi):
+        """把 [lo, hi) 按 part 边界拆开、逐段求链再前缀复合（= 竞品 merge 的语义）。"""
+        bounds = [lo] + [s for s in split_points if lo < s < hi] + [hi]
+        h = m = None
+        for a, b in zip(bounds, bounds[1:]):
+            hh, mm = chain_of(a, b)
+            h = hh if h is None else hh + torch.einsum("hkj,hjv->hkv", mm, h)
+            m = mm if m is None else torch.einsum("hkj,hjl->hkl", mm, m)
+        return h
+
     V = args.vdim
     # 用 1 元素张量（不用 0 维）做 all_reduce，避免后端对空/标量张量的限制
     worst_err = torch.zeros(1, device=dev)
@@ -313,18 +337,24 @@ def mode_cp(args):
                          cu_seqlens=(gs, g_lo), chunk_size=args.bt)[:, :, :V].to(dev)
         gt_ieee = run_kernel(t, [gs, g_lo], False, args.bt, prec="ieee")[0][:, :, :V]
         gt_same = run_kernel(t, [gs, g_lo], False, args.bt, prec=kernel_prec)[0][:, :, :V]
+        gt_split = compose_prefix(gs, g_lo)
 
         err = (init[n] - gt_ieee).abs().max().reshape(1)
-        noise = (gt_same - gt_ieee).abs().max().reshape(1)
+        noise_prec = (gt_same - gt_ieee).abs().max().reshape(1)
+        noise_split = (gt_split - gt_same).abs().max().reshape(1)
         err_cpu = (init[n] - gt_cpu).abs().max().reshape(1)
         mag = gt_ieee.abs().max().reshape(1)
+        noise = torch.maximum(noise_prec, noise_split)
         thr = torch.maximum(torch.maximum(10 * noise, 0.05 * mag),
                             torch.tensor([1e-2], device=dev))
         worst_err = torch.maximum(worst_err, err)
         worst_noise = torch.maximum(worst_noise, noise)
         print(f"          seg#{n}: 全局[{g_lo},{g_hi}) 需要携带状态 ← 从 {gs} 扫到 {g_lo} 共 "
               f"{g_lo - gs} tokens  |gt|max={mag.item():.3e}")
-        print(f"                 噪声基准 |单调用{args.cp_precision} - 单调用ieee| = {noise.item():.3e}")
+        print(f"                 噪声基准A 精度档位 |单调用{args.cp_precision} - 单调用ieee| = "
+              f"{noise_prec.item():.3e}")
+        print(f"                 噪声基准B 拆块分解 |同精度拆块复合 - 同精度单调用| = "
+              f"{noise_split.item():.3e}  （拆点 {[s for s in split_points if gs < s < g_lo]}）")
         print(f"                 CP 路径 |init - 单调用ieee| = {err.item():.3e}"
               f"   (vs CPU 标杆 {err_cpu.item():.3e})"
               f"   rel={err.item() / max(mag.item(), 1e-12):.3e}"
