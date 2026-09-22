@@ -15,12 +15,14 @@
 
   [B] --mode cp （torchrun，world_size>=2）
       跑完整 wrapper（build_cp_context + pre_process + merge），与独立 ground truth 比
-      returned initial_state。两组输入：
-        B1  切点对齐序列边界（对照，ground truth 应全 0）
-        B2  一个 part 含多条序列、且切点落在序列内部（目标场景）
+      returned initial_state。三个 preset：
+        aligned  切点全部对齐序列边界 —— **纯对照**：两个 rank 都 is_first & is_last，
+                 kernel 与 merge 都不发，所以它过不过与被测语义无关（只看有没有多余状态）
+        cut      一条序列被从中间切开（最经典的 CP 情形）
+        multi    一个 part 含多条序列、且切点落在序列内部（目标场景，末段 != 跨界段）
       结论项：
-        B1  initial_state == 0
-        B2  initial_state == "沿真实递推扫到窗口起点"的状态
+        需要携带状态的段上  initial_state == "沿真实递推扫到窗口起点"的状态
+        其余段上            initial_state == 0
 
       每个"需要携带状态"的段会打三行数：
         |gt|max                                      ground truth 的量级
