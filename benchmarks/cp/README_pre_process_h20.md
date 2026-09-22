@@ -253,3 +253,55 @@ device=NVIDIA H20 torch=... triton=...
 
 三个数互相印证；如果 nsys 与 event 法差出几倍，通常是 autotune 还没收敛或有别的
 kernel 混进来了，需要重采。
+
+## 15. CP 对齐检查（`check_cp_alignment.py`）
+
+回答两个问题：**多段一次算是否等于逐段算**（= AscendC 算子接口的多段语义是否成立），
+以及**竞品在多段 part 下导出的边界状态是否正确**（CP 包装层一次只喂"每个 part 的末段"）。
+
+### A. hm 级（单卡）
+
+```bash
+python -m benchmarks.cp.check_cp_alignment --mode hm
+```
+
+对 3 个 case（对齐段、非 64 倍数多段、GVA 1:2）各做三方对比：
+
+```text
+A1  逐段调用（MULTI_SEQS=False）    vs  CPU 标杆
+A2  多段一次调用（MULTI_SEQS=True） vs  CPU 标杆
+A3  多段一次调用                    vs  逐段调用
+```
+
+`A2`、`A3` 通过 → **kernel 侧的 `MULTI_SEQS` 能力可用**，一次 launch 处理多段与逐段等价；
+这也是 AscendC 算子"多段 `cu_seqlens`"接口的依据。都用 `AFFINE_CHAIN_PRECISION="ieee"`，
+否则 triton 走 tf32，m 半边会差出 1e-2 量级。
+
+### B. CP 级（多卡）
+
+```bash
+torchrun --nproc_per_node=2 -m benchmarks.cp.check_cp_alignment --mode cp --preset aligned
+torchrun --nproc_per_node=2 -m benchmarks.cp.check_cp_alignment --mode cp --preset multi
+torchrun --nproc_per_node=2 -m benchmarks.cp.check_cp_alignment --mode cp --preset multi --layout zigzag
+```
+
+跑完整 wrapper（`build_cp_context` + `pre_process` + `merge`），把返回的 `initial_state`
+与独立 ground truth 比——ground truth 是"沿该序列的真实递推扫到本 rank 窗口起点"的 h，
+用 `pre_process_h20/reference.py` 直接算。
+
+两个 preset：
+
+| preset | 全局 `cu_seqlens` | part_len | 形状 |
+| --- | --- | --- | --- |
+| `aligned` | `[0,128,256,384,512]` | 256 | 切点正好落在序列边界（对照，`initial_state` 应全 0） |
+| `multi` | `[0,40,600,700,1024]` | 512 | **rank1 的窗口 = seq1 的尾巴 + seq2 全段 + seq3 的前半段**，末段 ≠ 跨界段 |
+
+判读：`aligned` 的 max_abs 应为 0；`multi` 下 rank1 若显著 >0，说明"每 part 只喂末段"
+在多段 part 下与真实递推不一致——这正是 AscendC 算子接口把多段显式化的依据。
+
+回贴格式：
+
+```text
+[rank r] layout=... part_len=... local_segs=[...] 需要携带的段数=n max_abs=x.xxxe-0x
+[preset=...] 全局 max_abs=x.xxxe-0x
+```
