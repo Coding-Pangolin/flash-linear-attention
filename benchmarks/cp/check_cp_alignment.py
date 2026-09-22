@@ -123,8 +123,11 @@ def run_cpu(t, cu_list, BT):
 
 
 def report(tag, got, want, atol=1e-6, rtol=2e-3):
-    d = (got.float() - want.float()).abs()
-    denom = want.float().abs().clamp_min(1e-6)
+    # CPU 标杆在 CPU 上，GPU 结果在 device 上：统一搬到 CPU 再比（张量都很小）
+    got = got.detach().float().cpu()
+    want = want.detach().float().cpu()
+    d = (got - want).abs()
+    denom = want.abs().clamp_min(1e-6)
     matched = (d <= atol + rtol * denom).float().mean().item()
     print(f"  {tag:<34} max_abs={d.max().item():.3e}  mean_abs={d.mean().item():.3e}  matched={matched:.6f}")
     return d.max().item(), matched
