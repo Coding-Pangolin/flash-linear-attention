@@ -42,6 +42,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -178,6 +179,8 @@ def mode_hm(args):
 CP_PRESETS = {
     # 对照：切点（part_len 的整数倍）正好落在序列边界上
     "aligned": dict(segs=[0, 128, 256, 384, 512], world_hint=2),
+    # 最经典的 CP 情形：一条序列被从中间切开（rank1 的窗口起点落在 seq0 内部）
+    "cut": dict(segs=[0, 600, 1024], world_hint=2),
     # 目标：part 含多条序列，且切点落在序列内部（rank1 的窗口 = seq1 的尾巴
     #       + seq2 全段 + seq3 的前半段，末段 ≠ 跨界段）
     "multi": dict(segs=[0, 40, 600, 700, 1024], world_hint=2),
@@ -198,12 +201,16 @@ def _kernel_prec(cp_precision: str):
 
 
 def mode_cp(args):
-    dist.init_process_group("nccl")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    dev = torch.device("cuda", local_rank % torch.cuda.device_count())
+    torch.cuda.set_device(dev)
+    try:                       # 显式给 device_id，避免 barrier/init 的设备警告
+        dist.init_process_group("nccl", device_id=dev)
+    except TypeError:          # 老版本 torch 没有 device_id
+        dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
     if world < 2:
         raise SystemExit(f"CP 检查需要 world_size >= 2，当前 world_size={world}（请用 torchrun 起）")
-    dev = torch.device("cuda", rank % torch.cuda.device_count())
-    torch.cuda.set_device(dev)
 
     preset = CP_PRESETS[args.preset]
     segs = list(args.segs) if args.segs else list(preset["segs"])
@@ -217,8 +224,13 @@ def mode_cp(args):
     t = build_inputs(T, args.hk, args.hv, args.kdim, args.vdim, args.bt, dev, seed=args.seed)
     use_tf32x3 = args.cp_precision == "tf32x3"
     kernel_prec = _kernel_prec(args.cp_precision)
-    ctx = build_cp_context(torch.tensor(segs, dtype=I32), dist.group.WORLD,
+    # 注意：build_cp_context 是从传进来的 cu_seqlens **推导设备**的
+    # （`local.to(device=cu_seqlens.device)`），所以这里必须给 device 张量，
+    # 否则 context.cu_seqlens 会留在 CPU 上，kernel 启动时报
+    # "Pointer argument (at 8) cannot be accessed from Triton (cpu tensor?)"。
+    ctx = build_cp_context(torch.tensor(segs, dtype=I32, device=dev), dist.group.WORLD,
                            layout=args.layout, use_tf32x3_affine_chain=use_tf32x3)
+    assert ctx.cu_seqlens.is_cuda, f"context.cu_seqlens 还在 {ctx.cu_seqlens.device} 上"
     # 注意：FLACPContext.part_len 只在 zigzag 分支里被赋值，contiguous 下是 None，
     # 所以这里自己按 num_parts 算一遍。
     part_len = T // num_parts
@@ -268,7 +280,19 @@ def mode_cp(args):
     n_carry = 0
 
     print(f"[rank {rank}] layout={args.layout} part_len={part_len} ranges={ranges} "
-          f"local_segs={cu_local} cp_precision={args.cp_precision}")
+          f"local_segs={cu_local} cp_precision={args.cp_precision} "
+          f"ctx_cu_seqlens.device={ctx.cu_seqlens.device}")
+    # 把 wrapper 的判定也打出来：contiguous 下 is_last_rank 决定"发不发 kernel"，
+    # is_first_rank 决定"做不做 merge"；两个都为 True 就是纯对照（本 rank 什么都不用算）。
+    if args.layout == "contiguous":
+        print(f"          is_first_rank={ctx.is_first_rank} is_last_rank={ctx.is_last_rank} "
+              f"pre_num_ranks={ctx.pre_num_ranks} post_num_ranks={ctx.post_num_ranks}")
+        if ctx.is_first_rank and ctx.is_last_rank:
+            print("          （该 rank 既不用发 kernel 也不用 merge：切点全落在序列边界上，纯对照）")
+    else:
+        print(f"          is_first_by_part={ctx.is_first_by_part} "
+              f"is_last_by_part={ctx.is_last_by_part} "
+              f"pre_by_part={ctx.pre_num_ranks_by_part} post_by_part={ctx.post_num_ranks_by_part}")
     for n in range(n_loc):
         g_lo, g_hi = to_global(cu_local[n]), to_global_end(cu_local[n + 1])
         gs = seq_start(g_lo)

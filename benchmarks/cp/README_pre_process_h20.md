@@ -281,6 +281,7 @@ A3  多段一次调用                    vs  逐段调用
 
 ```bash
 torchrun --nproc_per_node=2 -m benchmarks.cp.check_cp_alignment --mode cp --preset aligned
+torchrun --nproc_per_node=2 -m benchmarks.cp.check_cp_alignment --mode cp --preset cut
 torchrun --nproc_per_node=2 -m benchmarks.cp.check_cp_alignment --mode cp --preset multi
 torchrun --nproc_per_node=2 -m benchmarks.cp.check_cp_alignment --mode cp --preset multi --layout zigzag
 ```
@@ -291,15 +292,25 @@ torchrun --nproc_per_node=2 -m benchmarks.cp.check_cp_alignment --mode cp --pres
 是不是"被 CP 切开的段"（起点不是任何序列的起点）；只有这种段才需要携带状态，也才是
 竞品那套"每 part 只喂末段 + 前缀复合"真正要负责的东西。
 
-两个 preset：
+三个 preset：
 
 | preset | 全局 `cu_seqlens` | part_len | 形状 |
 | --- | --- | --- | --- |
-| `aligned` | `[0,128,256,384,512]` | 256 | 切点正好落在序列边界（对照，`initial_state` 应全 0） |
+| `aligned` | `[0,128,256,384,512]` | 256 | 切点正好落在序列边界：**纯对照**（两个 rank 都 `is_first_rank & is_last_rank`，kernel 与 merge 都不发） |
+| `cut` | `[0,600,1024]` | 512 | 最经典的 CP 情形：一条序列被从中间切开，rank1 的 `seg#0` 要携带 `[0,512)` 的状态 |
 | `multi` | `[0,40,600,700,1024]` | 512 | **rank1 的窗口 = seq1 的尾巴 + seq2 全段 + seq3 的前半段**，末段 ≠ 跨界段 |
 
-（`aligned` 这份是给 **contiguous** 布局用的对照：它的切点正好压在序列边界上。zigzag
-布局下切点是 `T/(2W)` 的整数倍，不一定落在序列边界，所以那一路不必要求全 0。)
+`aligned` 相当于"什么都不做"的对照，所以不能只看它过没过：脚本会把每个 rank 的
+`is_first_rank / is_last_rank`（contiguous）或 `is_first_by_part / is_last_by_part`（zigzag）
+打出来，两个都是 True 就说明这一路根本没发 kernel。真正验证 wrap 语义的是 `cut` 与 `multi`。
+（zigzag 的切点是 `T/(2W)` 的整数倍，不一定落在序列边界，所以 zigzag 的 `aligned` 不必要求全 0。）
+
+> 踩过的坑：`build_cp_context` 是从传进来的 `cu_seqlens` **推导设备**的
+> （内部 `local.to(device=cu_seqlens.device)`）。传 CPU 张量进去，`context.cu_seqlens`
+> 就留在 CPU 上，直到 kernel 启动才报
+> `ValueError: Pointer argument (at 8) cannot be accessed from Triton (cpu tensor?)`
+> ——索引 8 正是 `cu_seqlens`。（`aligned` 因为根本不发 kernel，所以这个坑不会暴露。）
+> 脚本现在传 device 张量，并在 header 回显 `ctx_cu_seqlens.device`。
 
 CP 路径的精度由 `--cp-precision` 控制（`tf32x3`（默认）/ `tf32`，经
 `use_tf32x3_affine_chain` 透传给 wrapper；`ieee` 在 H20 上走不通，所以不作为 CP 路径选项）。
