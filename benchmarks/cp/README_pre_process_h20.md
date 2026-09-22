@@ -286,8 +286,10 @@ torchrun --nproc_per_node=2 -m benchmarks.cp.check_cp_alignment --mode cp --pres
 ```
 
 跑完整 wrapper（`build_cp_context` + `pre_process` + `merge`），把返回的 `initial_state`
-与独立 ground truth 比——ground truth 是"沿该序列的真实递推扫到本 rank 窗口起点"的 h，
-用 `pre_process_h20/reference.py` 直接算。
+与独立 ground truth 比——ground truth 是"沿该序列的真实递推扫到本 rank 窗口起点"的 h。
+每个 rank 先按 `cp_ranges` 把全局 token 轴切给各窗口/各 rank，再逐个 local segment 判断它
+是不是"被 CP 切开的段"（起点不是任何序列的起点）；只有这种段才需要携带状态，也才是
+竞品那套"每 part 只喂末段 + 前缀复合"真正要负责的东西。
 
 两个 preset：
 
@@ -296,12 +298,30 @@ torchrun --nproc_per_node=2 -m benchmarks.cp.check_cp_alignment --mode cp --pres
 | `aligned` | `[0,128,256,384,512]` | 256 | 切点正好落在序列边界（对照，`initial_state` 应全 0） |
 | `multi` | `[0,40,600,700,1024]` | 512 | **rank1 的窗口 = seq1 的尾巴 + seq2 全段 + seq3 的前半段**，末段 ≠ 跨界段 |
 
-判读：`aligned` 的 max_abs 应为 0；`multi` 下 rank1 若显著 >0，说明"每 part 只喂末段"
-在多段 part 下与真实递推不一致——这正是 AscendC 算子接口把多段显式化的依据。
+（`aligned` 这份是给 **contiguous** 布局用的对照：它的切点正好压在序列边界上。zigzag
+布局下切点是 `T/(2W)` 的整数倍，不一定落在序列边界，所以那一路不必要求全 0。)
+
+CP 路径的精度由 `--cp-precision` 控制（`tf32x3`（默认）/ `tf32`，经
+`use_tf32x3_affine_chain` 透传给 wrapper；`ieee` 在 H20 上走不通，所以不作为 CP 路径选项）。
+因为要区分"语义错"和"精度抖"，脚本对每个需要携带状态的段都会算三条对照：
+
+| 量 | 含义 |
+| --- | --- |
+| `|gt|max` | ground truth 的量级 |
+| 噪声基准 = `|单调用<cp-precision> - 单调用ieee|` | 同一支 kernel、**不做任何 merge**、只换个精度时的抖动 |
+| CP 路径 = `|init - 单调用ieee|` | 竞品 chained-merge 的结果与真值的差 |
+
+判读：CP 路径 ≈ 噪声基准 → 语义一致；差出几个量级 → 竞品"每 part 只喂末段"在多段 part
+下与真实递推不一致（这正是 AscendC 算子接口把多段显式化的依据）。`aligned` 那一路没有段
+需要携带状态，所以只看"期望为 0 的段上 |init|max"是不是 0。
 
 回贴格式：
 
 ```text
-[rank r] layout=... part_len=... local_segs=[...] 需要携带的段数=n max_abs=x.xxxe-0x
-[preset=...] 全局 max_abs=x.xxxe-0x
+[rank r] layout=... part_len=... ranges=[...] local_segs=[...] cp_precision=...
+          seg#0: 全局[a,b) 需要携带状态 ← 从 s 扫到 a 共 n tokens |gt|max=...
+                 噪声基准 |单调用tf32x3 - 单调用ieee| = ...
+                 CP 路径 |init - 单调用ieee| = ... (vs CPU 标杆 ...) rel=... 阈值 ... → 一致
+[preset=... layout=... cp_precision=... world=...]
+  本 rank 需要携带状态的段数=n 全局 max|init-gt_ieee|=... 噪声基准=... 期望为 0 的段上 |init|max=...
 ```

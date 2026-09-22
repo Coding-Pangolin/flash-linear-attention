@@ -22,6 +22,14 @@
         B1  initial_state == 0
         B2  initial_state == "沿真实递推扫到窗口起点"的状态
 
+      每个"需要携带状态"的段会打三行数：
+        |gt|max                                      ground truth 的量级
+        噪声基准 = |单调用<cp-precision> - 单调用ieee|  同一支 kernel 不做 merge 时的精度抖动
+        CP 路径  = |init - 单调用ieee|                  竞品 chained-merge 的结果与真值之差
+      判据：CP 路径 ≈ 噪声基准 → 语义一致；差出几个量级 → 竞品在多段 part 下不一致。
+      注意 wrapper 不接受 ieee（H20 上只有 tf32 / tf32x3 两条路），所以 CP 路径的精度
+      由 --cp-precision 控制，默认 tf32x3（最接近真值）。
+
 用法：
     python  -m benchmarks.cp.check_cp_alignment --mode hm
     torchrun --nproc_per_node=2 -m benchmarks.cp.check_cp_alignment --mode cp
@@ -88,8 +96,12 @@ def build_inputs(T, HK, HV, K, V, BT, device, seed=0, use_bg=False):
 
 
 # ------------------------------------------------------------- 直接调 Triton kernel
-def run_kernel(t, cu_list, multi_seqs, BT):
-    """按 cu_list=[s0,s1,...] 在 GPU 上跑上游 kernel，返回 hm [N,HV,K,V+K] fp32。"""
+def run_kernel(t, cu_list, multi_seqs, BT, prec=PREC):
+    """按 cu_list=[s0,s1,...] 在 GPU 上跑上游 kernel，返回 hm [N,HV,K,V+K] fp32。
+
+    prec 直接接到 kernel 的 AFFINE_CHAIN_PRECISION（只影响 m 那侧的 FP32 链式乘）：
+    "ieee" / "tf32x3" / None（None = triton 默认，NVIDIA 上是 tf32）。
+    """
     HK, HV, K, V, T = t["HK"], t["HV"], t["K"], t["V"], t["T"]
     dev = t["k"].device
     bs = 32 if K <= 64 else 64
@@ -97,7 +109,7 @@ def run_kernel(t, cu_list, multi_seqs, BT):
     hm = torch.zeros(nseg, HV, K, V + K, dtype=F32, device=dev)
     common = dict(v=t["v"], w=t["w"], g=None, gk=t["gk"], bg=t["bg"], u=t["u"],
                   T=T, H=HK, HV=HV, K=K, V=V, BT=BT, BLOCK_SIZE=bs,
-                  BK1=triton.next_power_of_2(K), AFFINE_CHAIN_PRECISION=PREC)
+                  BK1=triton.next_power_of_2(K), AFFINE_CHAIN_PRECISION=prec)
     grid_x = triton.cdiv(V, bs) + triton.cdiv(K, bs)
     if multi_seqs:
         # 一段一个 program：cu_seqlens 全程给全，i_n 由 grid 第三维承载
@@ -180,69 +192,127 @@ def cp_ranges(layout, part_len, rank, world):
     return [front, back]
 
 
+def _kernel_prec(cp_precision: str):
+    """--cp-precision → kernel 的 AFFINE_CHAIN_PRECISION（只作用于 m 那侧的 FP32 链）。"""
+    return {"tf32x3": "tf32x3", "tf32": None}[cp_precision]
+
+
 def mode_cp(args):
     dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
+    if world < 2:
+        raise SystemExit(f"CP 检查需要 world_size >= 2，当前 world_size={world}（请用 torchrun 起）")
     dev = torch.device("cuda", rank % torch.cuda.device_count())
     torch.cuda.set_device(dev)
 
     preset = CP_PRESETS[args.preset]
     segs = list(args.segs) if args.segs else list(preset["segs"])
+    if segs[0] != 0 or any(b <= a for a, b in zip(segs, segs[1:])):
+        raise SystemExit(f"--segs 必须是从 0 开始的严格递增边界，当前 {segs}")
     num_parts = world if args.layout == "contiguous" else 2 * world
     if segs[-1] % num_parts != 0:
         raise SystemExit(f"segs[-1]={segs[-1]} 必须能被 num_parts={num_parts}（{args.layout}）整除")
 
     T = segs[-1]
     t = build_inputs(T, args.hk, args.hv, args.kdim, args.vdim, args.bt, dev, seed=args.seed)
-    ctx = build_cp_context(torch.tensor(segs, dtype=I32), dist.group.WORLD, layout=args.layout)
-    part_len = ctx.part_len
+    use_tf32x3 = args.cp_precision == "tf32x3"
+    kernel_prec = _kernel_prec(args.cp_precision)
+    ctx = build_cp_context(torch.tensor(segs, dtype=I32), dist.group.WORLD,
+                           layout=args.layout, use_tf32x3_affine_chain=use_tf32x3)
+    # 注意：FLACPContext.part_len 只在 zigzag 分支里被赋值，contiguous 下是 None，
+    # 所以这里自己按 num_parts 算一遍。
+    part_len = T // num_parts
     ranges = cp_ranges(args.layout, part_len, rank, world)
 
     def local_of(x):
-        return torch.cat([x[lo:hi] for lo, hi in ranges], dim=0).contiguous()
+        # wrapper 要求 4 维 [B, T, H, D]：补一个 B=1 维
+        return torch.cat([x[lo:hi] for lo, hi in ranges], dim=0).unsqueeze(0).contiguous()
 
     out = cpdh.chunk_gated_delta_rule_fwd_h_pre_process(
         k=local_of(t["k"]), w=local_of(t["w"]), u=local_of(t["v"]), v=None,
-        gk=local_of(t["gk"]), cu_seqlens=ctx.cu_seqlens, context=ctx)
-    init = out[0] if isinstance(out, (tuple, list)) else out
-    init = init.float()
+        chunk_size=args.bt, gk=local_of(t["gk"]),
+        cu_seqlens=ctx.cu_seqlens, context=ctx)
+    init = (out[0] if isinstance(out, (tuple, list)) else out).float()
 
     cu_local = [int(v) for v in ctx.cu_seqlens.cpu().tolist()]
     n_loc = len(cu_local) - 1
 
     def to_global(i):
+        # 局部下标 → 全局 token 下标，用于"段的左端点"。zigzag 下各窗口在全局空间里不连续，
+        # 所以正好落在窗口右端点的下标要归到"下一个窗口的左端点"。
+        # i 可以取到 T_local，此时归到最后一段的右端点。
         base = 0
-        for lo, hi in ranges:
-            if i < base + (hi - lo):
+        for j, (lo, hi) in enumerate(ranges):
+            if i < base + (hi - lo) or j == len(ranges) - 1:
                 return lo + (i - base)
             base += hi - lo
         raise IndexError(i)
 
-    gt = torch.zeros_like(init)
-    for n in range(n_loc):
-        g_lo = to_global(cu_local[n])
-        gs = max(s for s in segs if s <= g_lo)
-        if g_lo > gs:                      # 该段的第一条 token 不是序列起点 → 需要携带状态
-            hm = cpu_ref(t["k"].cpu(), t["v"].cpu(), t["w"].cpu(), gk=t["gk"].cpu(),
-                         cu_seqlens=(gs, g_lo), chunk_size=args.bt)
-            gt[n] = hm[:, :, :args.vdim].to(dev)
+    def to_global_end(i):
+        # 局部下标 → 全局 token 下标，用于"段的右端点"：正好落在窗口边界时取该窗口的右端。
+        base = 0
+        for j, (lo, hi) in enumerate(ranges):
+            if i <= base + (hi - lo) or j == len(ranges) - 1:
+                return lo + (i - base)
+            base += hi - lo
+        raise IndexError(i)
 
-    d = (init - gt).abs()
-    nz = int((gt.abs().sum(dim=(1, 2, 3)) > 0).sum().item())
+    def seq_start(g):
+        return max(s for s in segs if s <= g)
+
+    V = args.vdim
+    # 用 1 元素张量（不用 0 维）做 all_reduce，避免后端对空/标量张量的限制
+    worst_err = torch.zeros(1, device=dev)
+    worst_noise = torch.zeros(1, device=dev)
+    worst_zero = torch.zeros(1, device=dev)
+    n_carry = 0
+
     print(f"[rank {rank}] layout={args.layout} part_len={part_len} ranges={ranges} "
-          f"local_segs={cu_local} 需要携带的段数={nz}  max_abs={d.max().item():.3e}")
-    if nz:
-        for n in range(n_loc):
-            if gt[n].abs().sum() > 0:
-                print(f"           seg#{n}: max_abs={(init[n] - gt[n]).abs().max().item():.3e} "
-                      f"|gt|max={gt[n].abs().max().item():.3e}")
+          f"local_segs={cu_local} cp_precision={args.cp_precision}")
+    for n in range(n_loc):
+        g_lo, g_hi = to_global(cu_local[n]), to_global_end(cu_local[n + 1])
+        gs = seq_start(g_lo)
+        if g_lo == gs:
+            z = init[n].abs().max().reshape(1)
+            worst_zero = torch.maximum(worst_zero, z)
+            print(f"          seg#{n}: 全局[{g_lo},{g_hi}) 起点即序列起点({gs}) → 期望 0，"
+                  f"实测 |init|max={z.item():.3e}")
+            continue
+        n_carry += 1
+        # ground truth = 沿该序列的真实递推，从序列起点扫到本 rank 窗口起点；三种口径：
+        #   CPU 标杆（fp32 主机，定义上的真值）
+        #   单调用 kernel + ieee（GPU 上不做 merge 的真值）
+        #   单调用 kernel + 与 CP 路径相同精度（本机精度噪声基准）
+        gt_cpu = cpu_ref(t["k"].cpu(), t["v"].cpu(), t["w"].cpu(), gk=t["gk"].cpu(),
+                         cu_seqlens=(gs, g_lo), chunk_size=args.bt)[:, :, :V].to(dev)
+        gt_ieee = run_kernel(t, [gs, g_lo], False, args.bt, prec="ieee")[0][:, :, :V]
+        gt_same = run_kernel(t, [gs, g_lo], False, args.bt, prec=kernel_prec)[0][:, :, :V]
+
+        err = (init[n] - gt_ieee).abs().max().reshape(1)
+        noise = (gt_same - gt_ieee).abs().max().reshape(1)
+        err_cpu = (init[n] - gt_cpu).abs().max().reshape(1)
+        mag = gt_ieee.abs().max().reshape(1)
+        thr = torch.maximum(torch.maximum(10 * noise, 0.05 * mag),
+                            torch.tensor([1e-2], device=dev))
+        worst_err = torch.maximum(worst_err, err)
+        worst_noise = torch.maximum(worst_noise, noise)
+        print(f"          seg#{n}: 全局[{g_lo},{g_hi}) 需要携带状态 ← 从 {gs} 扫到 {g_lo} 共 "
+              f"{g_lo - gs} tokens  |gt|max={mag.item():.3e}")
+        print(f"                 噪声基准 |单调用{args.cp_precision} - 单调用ieee| = {noise.item():.3e}")
+        print(f"                 CP 路径 |init - 单调用ieee| = {err.item():.3e}"
+              f"   (vs CPU 标杆 {err_cpu.item():.3e})"
+              f"   rel={err.item() / max(mag.item(), 1e-12):.3e}"
+              f"   阈值 {thr.item():.3e} → {'一致' if err <= thr else '不一致（需人工确认）'}")
     dist.barrier()
-    worst = torch.tensor([d.max().item()], device=dev)
-    dist.all_reduce(worst, op=dist.ReduceOp.MAX)
+    for x in (worst_err, worst_noise, worst_zero):
+        dist.all_reduce(x, op=dist.ReduceOp.MAX)
     if rank == 0:
-        print(f"\n[preset={args.preset}] 全局 max_abs = {worst.item():.3e}")
-        print("判读：对照组（aligned）应为 0；目标组（multi）若显著 >0，说明竞品"
-              "「每 part 只喂末段」在多段 part 下与真实递推不一致。")
+        print(f"\n[preset={args.preset} layout={args.layout} cp_precision={args.cp_precision} "
+              f"world={world}]")
+        print(f"  本 rank 需要携带状态的段数={n_carry}  全局 max|init-gt_ieee|={worst_err.item():.3e}"
+              f"  噪声基准={worst_noise.item():.3e}  期望为 0 的段上 |init|max={worst_zero.item():.3e}")
+        print("  判读：对照组 aligned（没有段需要携带状态）应全 0。若 init 与 ieee 的差只到噪声量级"
+              " → 竞品「每 part 只喂末段」在多段 part 下与真实递推一致；若差出几个量级 → 不一致。")
     dist.destroy_process_group()
 
 
@@ -253,6 +323,8 @@ def main(argv=None):
     ap.add_argument("--mode", choices=("hm", "cp"), default="hm")
     ap.add_argument("--preset", choices=sorted(CP_PRESETS), default="multi")
     ap.add_argument("--layout", choices=("contiguous", "zigzag"), default="contiguous")
+    ap.add_argument("--cp-precision", choices=("tf32x3", "tf32"), default="tf32x3",
+                    help="CP 路径上 m 那侧 FP32 链式乘的精度（经 use_tf32x3_affine_chain 透传）")
     ap.add_argument("--segs", type=int, nargs="*", default=None,
                     help="全局打包序列边界，如 --segs 0 40 600 700 1024")
     ap.add_argument("--hv", type=int, default=32, help="value head 数")
